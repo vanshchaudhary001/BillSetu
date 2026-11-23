@@ -1,0 +1,4 @@
+Invoice No,Invoice Date,Customer Name,Buyer GSTIN,Buyer Address,Taxable Value,CGST,SGST,IGST,Tax Amount,Grand Total,Place of Supply,HSN/SAC
+BS/26-27/101,20/10/2026,Mehta Traders,27AAKFM2916L1ZY,"12 Market Road, Pune, Maharashtra",20000,0,0,3600,3600,23600,Maharashtra,8536
+BS/26-27/102,22/10/2026,Walk-in customer,Unregistered,,105000,0,0,18900,18900,123900,Rajasthan,8536
+BS/26-27/103,23/10/2026,Walk-in customer,Unregistered,"14 Market Road, Lucknow, Uttar Pradesh",6000,540,540,0,1080,7080,Uttar Pradesh,8536

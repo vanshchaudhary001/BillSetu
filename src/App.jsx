@@ -11,6 +11,8 @@ import { deriveInvoiceStatus, getBucket, getReadiness, invoiceInPeriod, runGSTCh
 import { demoInjectionInvoice, demoInvoice, normalizeDate, parseRegister, scanDocument, validateFile } from './lib/intake.js';
 import { deleteLocalDocument, loadLocalDocument, readLocalState, saveLocalDocument, writeLocalState, clearLocalWorkspace } from './lib/storage.js';
 import { downloadBlob, makeCAWorkbook, makeGstr1Draft } from './lib/exports.js';
+import { ApiError, exportInvoiceCsv, exportInvoiceJson, extractDocument, getDocumentAudit, getDocumentContent, getInvoiceAudit, getInvoiceGstr1, healthCheck, uploadDocument, validateInvoice } from './lib/api.js';
+import { mapBackendGstr1ToFrontendInvoice, mapBackendValidationToFrontendInvoice, mapCanonicalInvoiceToFrontendInvoice, markBackendGstr1Unavailable } from './lib/mappers.js';
 import './styles.css';
 import './app.css';
 
@@ -45,8 +47,41 @@ const money = value => new Intl.NumberFormat('en-IN', { style: 'currency', curre
 const fmtDate = value => { const d = new Date(`${String(value || '').slice(0,10)}T00:00:00`); return Number.isNaN(d.valueOf()) ? 'Date to confirm' : d.toLocaleDateString('en-IN', { day:'2-digit', month:'short', year:'numeric' }); };
 const stateCodeFor = value => Object.entries(STATE_CODES).find(([, state]) => state.toLowerCase() === String(value || '').trim().toLowerCase())?.[0] || '';
 const statusName = status => ({ ready: 'Ready', blocked: 'Blocked', review: 'Review', purchase: 'Purchase' }[status] || 'Review');
+const invoiceFindings = (invoice, profile, invoices) => invoice?.validationAuthority === 'backend'
+  ? (Array.isArray(invoice.findings) ? invoice.findings : [])
+  : runGSTChecks(invoice, profile, invoices);
 
 function downloadText(text, type, filename) { downloadBlob(new Blob([text], { type }), filename); }
+function backendExportFilename(invoice, format) {
+  const component = String(invoice.no || invoice.backendInvoiceId || 'invoice')
+    .replace(/[^A-Za-z0-9._-]+/g, '_')
+    .replace(/^\.+/, '')
+    .replace(/[._]+$/, '')
+    .slice(0, 64) || 'invoice';
+  return `billsetu_${component}_gstr1.${format}`;
+}
+function validateBackendAuditEvents(events) {
+  const validMetadata = metadata => metadata
+    && typeof metadata === 'object'
+    && !Array.isArray(metadata)
+    && Object.values(metadata).every(value => value === null
+      || typeof value === 'string'
+      || typeof value === 'boolean'
+      || typeof value === 'number' && Number.isFinite(value));
+  const validEvents = Array.isArray(events) && events.every(event => event
+    && typeof event === 'object'
+    && typeof event.event_id === 'string'
+    && typeof event.document_id === 'string'
+    && (event.invoice_id === null || typeof event.invoice_id === 'string')
+    && typeof event.event_type === 'string'
+    && typeof event.status === 'string'
+    && typeof event.message === 'string'
+    && typeof event.created_at === 'string'
+    && Number.isFinite(Date.parse(event.created_at))
+    && validMetadata(event.metadata));
+  if (!validEvents) throw new Error('The backend returned an unexpected audit response.');
+  return events;
+}
 function Avatar({ children = 'RS' }) { return <span className="avatar-v2">{children}</span>; }
 
 export default function App() {
@@ -56,6 +91,20 @@ export default function App() {
     return saved.map(item => {
       const isoDate = normalizeDate(item.isoDate || item.date);
       const normalized = { ...item, id: item.id || crypto.randomUUID(), no: item.no || 'Invoice to identify', party: item.party || 'Buyer to confirm', gstin: item.gstin || 'Unregistered', date: isoDate || item.date || '', isoDate, direction: item.direction || 'sale', status: item.status || 'review', issues: Array.isArray(item.issues) ? item.issues : [], items: Array.isArray(item.items) ? item.items : [], source: item.source || 'Saved local record', confidence: item.confidence ?? 0, taxHeadsCaptured: item.taxHeadsCaptured ?? [item.cgst, item.sgst, item.igst, item.cess].some(value => Number(value || 0) > 0) };
+      if (normalized.validationAuthority === 'backend' || normalized.extractionSource === 'backend') {
+        if (normalized.backendValidation) {
+          try {
+            return mapBackendValidationToFrontendInvoice(normalized, normalized.backendValidation);
+          } catch (error) {
+            return mapBackendValidationToFrontendInvoice(normalized, null, `Saved backend validation is invalid: ${error.message}`);
+          }
+        }
+        return mapBackendValidationToFrontendInvoice(
+          normalized,
+          null,
+          normalized.backendValidationError || 'This saved backend extraction has no validation result. Re-upload it to obtain an authoritative result.',
+        );
+      }
       return makeInvoice(normalized);
     });
   });
@@ -73,12 +122,15 @@ export default function App() {
   const [profileEditing, setProfileEditing] = useState(false);
   const [profileDraft, setProfileDraft] = useState(profile);
   const [ruleQuery, setRuleQuery] = useState('');
+  const [backendState, setBackendState] = useState('checking');
   const [toastTimer, setToastTimer] = useState(0);
   const fileInput = useRef(null);
   const searchInput = useRef(null);
+  const backendGstr1Requests = useRef(new Set());
+  const sourcePreviewRequests = useRef(new Set());
   const activeInvoice = invoices.find(invoice => invoice.id === activeId);
   const labels = preferences.language === 'hi' ? HI : EN;
-  const checks = activeInvoice ? runGSTChecks(activeInvoice, profile, invoices) : [];
+  const checks = activeInvoice ? invoiceFindings(activeInvoice, profile, invoices) : [];
   const periodInvoices = invoices.filter(item => invoiceInPeriod(item, profile.period));
   const periodOutward = periodInvoices.filter(item => item.direction !== 'purchase');
   const issueCount = invoices.filter(item => item.direction !== 'purchase' && (item.status !== 'ready' || !invoiceInPeriod(item, profile.period))).length;
@@ -92,13 +144,52 @@ export default function App() {
     return matchesSearch && matchesFilter && matchesView;
   }), [invoices, query, filter, view]);
 
-  useEffect(() => { writeLocalState('invoices', invoices.map(({ fileUrl, ...invoice }) => invoice)); }, [invoices]);
+  useEffect(() => {
+    writeLocalState('invoices', invoices.map(({ fileUrl, sourceMediaType, sourcePreviewError, sourcePreviewStatus, ...invoice }) => invoice));
+  }, [invoices]);
   useEffect(() => { writeLocalState('profile', profile); }, [profile]);
   useEffect(() => { writeLocalState('preferences', preferences); }, [preferences]);
   useEffect(() => { writeLocalState('audit', audit.slice(0, 500)); }, [audit]);
   useEffect(() => {
+    let active = true;
+    healthCheck()
+      .then(result => { if (active) setBackendState(result?.status === 'ok' ? 'connected' : 'unavailable'); })
+      .catch(() => { if (active) setBackendState('unavailable'); });
+    return () => { active = false; };
+  }, []);
+  useEffect(() => {
+    const pending = invoices.filter(item => item.validationAuthority === 'backend'
+      && item.backendValidation
+      && item.backendGstr1Status === 'pending'
+      && !backendGstr1Requests.current.has(item.id));
+    if (!pending.length) return;
+
+    pending.forEach(item => backendGstr1Requests.current.add(item.id));
+    setInvoices(current => current.map(item => pending.some(candidate => candidate.id === item.id)
+      ? { ...item, backendGstr1Status: 'loading' }
+      : item));
+
+    pending.forEach(async invoice => {
+      try {
+        const response = await getInvoiceGstr1(invoice.backendInvoiceId);
+        const mapped = mapBackendGstr1ToFrontendInvoice({}, response);
+        setInvoices(current => current.map(item => item.id === invoice.id
+          ? mapBackendGstr1ToFrontendInvoice(item, mapped.backendGstr1)
+          : item));
+      } catch (error) {
+        const detail = error instanceof ApiError && typeof error.detail === 'string' && error.detail
+          ? ` ${error.detail}`
+          : '';
+        const unavailable = markBackendGstr1Unavailable({}, `${error.message || 'The backend GSTR-1 request failed.'}${detail}`);
+        setInvoices(current => current.map(item => item.id === invoice.id
+          ? markBackendGstr1Unavailable(item, unavailable.backendGstr1Error)
+          : item));
+      }
+    });
+  }, [invoices]);
+  useEffect(() => {
     setInvoices(current => current.map(item => {
-      if (item.direction === 'purchase' || invoiceInPeriod(item, profile.period) || (!item.confirmed && item.status !== 'ready')) return item;
+      if (item.direction === 'purchase' || item.validationAuthority === 'backend' || invoiceInPeriod(item, profile.period) || (!item.confirmed && item.status !== 'ready')) return item;
       const findings = runGSTChecks(item, profile, current);
       return { ...item, confirmed: false, status: deriveInvoiceStatus(findings, false), issues: findings.filter(finding => ['error', 'warning'].includes(finding.severity)).map(finding => finding.label) };
     }));
@@ -114,8 +205,40 @@ export default function App() {
     return () => window.removeEventListener('keydown', handleShortcut);
   }, []);
   useEffect(() => {
+    invoices.filter(item => item.id === activeId
+      && item.backendDocumentId
+      && !item.fileUrl
+      && item.sourcePreviewStatus !== 'unavailable'
+      && !sourcePreviewRequests.current.has(item.id)).forEach(item => {
+      sourcePreviewRequests.current.add(item.id);
+      getDocumentContent(item.backendDocumentId).then(blob => {
+        if (!blob.type.startsWith('image/') && blob.type !== 'application/pdf') {
+          throw new ApiError('This uploaded document type cannot be previewed.', 415);
+        }
+        const fileUrl = URL.createObjectURL(blob);
+        setInvoices(current => {
+          if (!current.some(row => row.id === item.id)) {
+            URL.revokeObjectURL(fileUrl);
+            return current;
+          }
+          return current.map(row => row.id === item.id
+            ? { ...row, fileUrl, sourceMediaType: blob.type, sourcePreviewStatus: 'available', sourcePreviewError: '' }
+            : row);
+        });
+      }).catch(error => {
+        setInvoices(current => current.map(row => row.id === item.id
+          ? {
+            ...row,
+            sourcePreviewStatus: 'unavailable',
+            sourcePreviewError: error.message || 'The original source document is unavailable.',
+          }
+          : row));
+      }).finally(() => sourcePreviewRequests.current.delete(item.id));
+    });
+  }, [activeId, invoices]);
+  useEffect(() => {
     let cancelled = false;
-    invoices.filter(item => item.fileKey && !item.fileUrl).forEach(async item => {
+    invoices.filter(item => !item.backendDocumentId && item.fileKey && !item.fileUrl).forEach(async item => {
       try { const blob = await loadLocalDocument(item.fileKey); if (!cancelled && blob) setInvoices(current => current.map(row => row.id === item.id ? { ...row, fileUrl: URL.createObjectURL(blob) } : row)); } catch { /* local file may have been cleared */ }
     });
     return () => { cancelled = true; };
@@ -131,6 +254,11 @@ export default function App() {
   const updateInvoice = (id, patch) => setInvoices(previous => previous.map(item => {
     if (item.id !== id) return item;
     const next = { ...item, ...patch };
+    if (next.validationAuthority === 'backend') {
+      next.status = item.status;
+      if (patch.confirmed === false) next.backendValidationStale = true;
+      return next;
+    }
     if (patch.confirmed === true) return next;
     if (patch.confirmed === false || !next.confirmed) next.status = deriveInvoiceStatus(runGSTChecks(next, profile, previous), false);
     return next;
@@ -141,7 +269,7 @@ export default function App() {
     const nextProfile = { ...profile, period };
     setProfile(nextProfile);
     setInvoices(previous => previous.map(item => {
-      if (item.direction === 'purchase') return item;
+      if (item.direction === 'purchase' || item.validationAuthority === 'backend') return item;
       const findings = runGSTChecks(item, nextProfile, previous);
       if (invoiceInPeriod(item, period) && item.confirmed && item.status === 'ready') return item;
       return { ...item, confirmed: false, status: deriveInvoiceStatus(findings, false), issues: findings.filter(finding => ['error', 'warning'].includes(finding.severity)).map(finding => finding.label) };
@@ -159,7 +287,68 @@ export default function App() {
       try {
         validateFile(file);
         setScanProgress({ name: file.name, percent: 0, phase: 'Checking file' });
-        const result = await scanDocument(file, percent => setScanProgress({ name: file.name, percent, phase: 'Reading bill on this device' }));
+        let result;
+        let backendExtracted = false;
+        try {
+          setBackendState('checking');
+          setScanProgress({ name: file.name, percent: 10, phase: 'Uploading document to BillSetu' });
+          const uploaded = await uploadDocument(file);
+          if (!uploaded?.document_id) throw new ApiError('The backend upload did not return a document ID.', 422);
+          if (uploaded.status === 'quarantined') throw new ApiError('This document requires review and was quarantined by the backend.', 409);
+          setScanProgress({ name: file.name, percent: 45, phase: 'Extracting invoice on BillSetu' });
+          const extracted = await extractDocument(uploaded.document_id);
+          if (!extracted?.invoice || typeof extracted.invoice !== 'object' || typeof extracted.invoice_id !== 'string' || !extracted.invoice_id.trim()) {
+            throw new ApiError('The backend returned an unexpected extraction response.', 502);
+          }
+          const frontendInvoice = mapCanonicalInvoiceToFrontendInvoice(extracted.invoice, {
+            documentId: uploaded.document_id,
+            invoiceId: extracted.invoice_id,
+            fileName: file.name,
+          });
+          setScanProgress({ name: file.name, percent: 75, phase: 'Validating invoice on BillSetu' });
+          try {
+            const validation = await validateInvoice(extracted.invoice_id);
+            result = [mapBackendValidationToFrontendInvoice(frontendInvoice, validation)];
+            setBackendState('connected');
+          } catch (error) {
+            const message = error.message || 'The backend validation request failed.';
+            result = [mapBackendValidationToFrontendInvoice(frontendInvoice, null, message)];
+            setScanError(`${file.name}: validation failed. The extracted invoice was saved for review but cannot be confirmed. ${message}`);
+            setBackendState(error instanceof ApiError && error.status === 0 ? 'unavailable' : 'connected');
+          }
+          backendExtracted = true;
+        } catch (error) {
+          if (error instanceof ApiError && error.status === 409) {
+            setBackendState('connected');
+            let key = '';
+            try { key = crypto.randomUUID(); await saveLocalDocument(key, file); } catch { key = ''; }
+            const blobUrl = backendExtracted ? '' : URL.createObjectURL(file);
+            added.push({
+              id: `quarantine-${crypto.randomUUID()}`,
+              no: 'QUARANTINE', party: 'Buyer to confirm', gstin: 'Unregistered',
+              date: '', isoDate: '', amount: 0, tax: 0, cgst: 0, sgst: 0, igst: 0, cess: 0,
+              taxHeadsCaptured: false, totalWritten: 0, bucket: 'Review',
+              status: 'blocked', issues: ['Backend quarantine - document requires manual review'],
+              source: file.name, confidence: 0, color: 'coral',
+              kind: 'Quarantined document', supplier: profile.name,
+              supplierGstin: profile.gstin, supplierStateCode: profile.gstin.slice(0, 2),
+              supplierAddress: profile.address, pos: '', posStateCode: '',
+              hsn: '', direction: 'sale', rawText: '', items: [],
+              fileKey: key, fileUrl: blobUrl, sourcePersistenceFailed: !key,
+              extractionSource: 'backend',
+              validationAuthority: 'backend',
+              backendQuarantined: true,
+              backendValidationError: 'The backend quarantined this document before extraction.',
+            });
+            setScanError(`${file.name}: document requires review and was quarantined by the backend.`);
+            continue;
+          }
+          setBackendState(error instanceof ApiError && error.status === 0 ? 'unavailable' : 'connected');
+          setScanProgress({ name: file.name, percent: 0, phase: 'Backend unavailable - reading bill on this device' });
+          result = await scanDocument(file, percent => setScanProgress({ name: file.name, percent, phase: 'Reading bill on this device' }));
+          const message = error instanceof ApiError ? error.message : 'The backend request failed.';
+          setScanError(`${file.name}: ${message} Offline fallback is processing the document.`);
+        }
         if (Array.isArray(result) && result[0]?.kind === 'Sales register row') {
           const rows = result.map(row => {
             const enriched = { ...row, supplier: profile.name, supplierGstin: profile.gstin, supplierStateCode: profile.gstin.slice(0, 2), supplierAddress: profile.address };
@@ -176,12 +365,32 @@ export default function App() {
         try { key = crypto.randomUUID(); await saveLocalDocument(key, file); }
         catch { key = ''; /* keep extracted fields even when the browser cannot persist the source */ }
         const blobUrl = URL.createObjectURL(file);
-        const record = { ...result[0], fileKey: key, fileUrl: blobUrl, sourcePersistenceFailed: !key, supplier: profile.name, supplierGstin: profile.gstin, supplierStateCode: profile.gstin.slice(0, 2), supplierAddress: profile.address, posStateCode: '', issues: result[0].injectionDetected ? result[0].issues : ['Compare OCR fields with the original document'], status: result[0].injectionDetected ? 'blocked' : 'review' };
-        record.bucket = getBucket(record, profile);
-        const findings = runGSTChecks(record, profile, [...invoices, ...added]);
-        record.findings = findings;
-        record.status = deriveInvoiceStatus(findings, false);
-        record.issues = findings.filter(item => ['error', 'warning'].includes(item.severity)).map(item => item.label);
+        const record = {
+          ...result[0],
+          fileKey: key,
+          fileUrl: blobUrl,
+          sourcePersistenceFailed: !key,
+          supplier: result[0].supplier || profile.name,
+          supplierGstin: result[0].supplierGstin || profile.gstin,
+          supplierStateCode: result[0].supplierStateCode || profile.gstin.slice(0, 2),
+          supplierAddress: profile.address,
+          posStateCode: result[0].posStateCode || '',
+          issues: result[0].injectionDetected
+            ? result[0].issues
+            : backendExtracted
+              ? result[0].issues
+              : ['Compare OCR fields with the original document'],
+          status: result[0].injectionDetected ? 'blocked' : result[0].status || 'review',
+        };
+        if (backendExtracted) {
+          record.validationAuthority = 'backend';
+        } else {
+          record.bucket = getBucket(record, profile);
+          const findings = runGSTChecks(record, profile, [...invoices, ...added]);
+          record.findings = findings;
+          record.status = deriveInvoiceStatus(findings, false);
+          record.issues = findings.filter(item => ['error', 'warning'].includes(item.severity)).map(item => item.label);
+        }
         added.push(record);
       } catch (error) { setScanError(`${file.name}: ${error.message || 'Could not read this file.'}`); }
     }
@@ -191,7 +400,13 @@ export default function App() {
       if (added.length === 1 && added[0].direction !== 'purchase') setActiveId(added[0].id);
       added.forEach(item => recordAction(item, 'Imported for review', item.source));
       const sourceWarning = added.some(item => item.sourcePersistenceFailed);
-      notify(sourceWarning ? 'Bill fields were read, but this browser could not save an original file copy. Keep the source document separately.' : `${added.length} ${added.length === 1 ? 'record' : 'records'} added. Check every field before confirming.`, sourceWarning ? 'error' : 'success');
+      const validationFailed = added.some(item => item.validationAuthority === 'backend' && !item.backendValidation);
+      notify(validationFailed
+        ? 'The invoice was extracted, but backend validation failed. It remains in review and cannot be confirmed.'
+        : sourceWarning
+          ? 'Bill fields were read, but this browser could not save an original file copy. Keep the source document separately.'
+          : `${added.length} ${added.length === 1 ? 'record' : 'records'} added. Check every field before confirming.`,
+      validationFailed || sourceWarning ? 'error' : 'success');
     }
     setScanProgress(null);
   };
@@ -210,27 +425,44 @@ export default function App() {
 
   const confirmInvoice = invoice => {
     if (invoice.direction === 'purchase') { notify('Purchase bills stay outside the GSTR-1 draft. Their ITC eligibility is unverified.', 'error'); return false; }
-    const currentChecks = runGSTChecks(invoice, profile, invoices);
+    if (invoice.validationAuthority === 'backend'
+      && (invoice.backendValidationStale
+        || invoice.backendValidation?.status !== 'validated'
+        || invoice.backendValidation.export_ready !== true)) {
+      notify('This invoice cannot be confirmed until the backend returns a current, export-ready validation result.', 'error');
+      return false;
+    }
+    const currentChecks = invoiceFindings(invoice, profile, invoices);
     const blockers = currentChecks.filter(check => check.severity === 'error');
     if (blockers.length) { notify(`Resolve ${blockers.length} blocking check${blockers.length === 1 ? '' : 's'} before confirming.`, 'error'); return false; }
     const warnings = currentChecks.filter(check => check.severity === 'warning').map(check => check.label);
-    const confirmed = { ...invoice, confirmed: true, status: 'ready', issues: [], lastConfirmedAt: new Date().toISOString(), confirmedWarnings: warnings };
+    const confirmed = { ...invoice, confirmed: true, status: invoice.validationAuthority === 'backend' ? invoice.status : 'ready', issues: [], lastConfirmedAt: new Date().toISOString(), confirmedWarnings: warnings };
     updateInvoice(invoice.id, confirmed);
     recordAction(invoice, 'Confirmed by owner', warnings.length ? `Confirmed with acknowledged advisory: ${warnings.join(', ')}` : 'All blocking checks passed.');
     setActiveId('');
-    notify('Confirmed. This record is included in the review draft.');
+    notify(invoice.validationAuthority === 'backend'
+      ? 'Owner confirmation saved locally. Backend record is unchanged.'
+      : 'Confirmed. This record is included in the review draft.');
     return true;
   };
   const saveForLater = invoice => {
-    const findings = runGSTChecks(invoice, profile, invoices);
-    const status = deriveInvoiceStatus(findings, false);
-    updateInvoice(invoice.id, { ...invoice, status, issues: findings.filter(item => ['error','warning'].includes(item.severity)).map(item => item.label), findings });
-    recordAction(invoice, 'Saved for later', 'Edits saved; record remains outside the draft until confirmed.');
+    const findings = invoiceFindings(invoice, profile, invoices);
+    const status = invoice.validationAuthority === 'backend' ? invoice.status : deriveInvoiceStatus(findings, false);
+    const issues = invoice.validationAuthority === 'backend'
+      ? invoice.issues
+      : findings.filter(item => ['error','warning'].includes(item.severity)).map(item => item.label);
+    updateInvoice(invoice.id, { ...invoice, status, issues, findings });
+    const backendProcessed = Boolean(invoice.backendInvoiceId || invoice.backendDocumentId);
+    recordAction(invoice, 'Saved for later', backendProcessed
+      ? 'Local review draft saved; backend record is unchanged.'
+      : 'Edits saved; record remains outside the draft until confirmed.');
     setActiveId('');
-    notify('Saved. You can continue this review later.');
+    notify(backendProcessed
+      ? 'Review draft saved locally. Backend record is unchanged.'
+      : 'Saved. You can continue this review later.');
   };
   const escalateInvoice = invoice => {
-    const issues = runGSTChecks(invoice, profile, invoices).filter(item => item.severity === 'error' || item.severity === 'warning').map(item => item.label);
+    const issues = invoiceFindings(invoice, profile, invoices).filter(item => item.severity === 'error' || item.severity === 'warning').map(item => item.label);
     updateInvoice(invoice.id, { ...invoice, status: 'review', escalated: true, issues, escalatedAt: new Date().toISOString() });
     recordAction(invoice, 'Escalated for CA review', issues.join(', ') || 'Owner requests a second review.');
     setActiveId('');
@@ -238,7 +470,8 @@ export default function App() {
     notify('Added to the CA review queue. Download the CA pack to share it securely.');
   };
   const applySuggestedFix = (invoice, finding) => {
-    const patch = finding.id === 'R01' && finding.field === 'gstin' && gstinChecksumValid(finding.suggestedFix) ? { gstin: finding.suggestedFix } : finding.id === 'R03' ? { totalWritten: Number(invoice.amount || 0) + Number(invoice.tax || 0) } : finding.id === 'R10' ? { bucket: finding.suggestedFix } : null;
+    const ruleId = finding.ruleId || finding.id.split('-')[0];
+    const patch = ruleId === 'R01' && finding.field === 'gstin' && gstinChecksumValid(finding.suggestedFix) ? { gstin: finding.suggestedFix } : ruleId === 'R03' ? { totalWritten: Number(invoice.amount || 0) + Number(invoice.tax || 0) } : ruleId === 'R10' ? { bucket: finding.suggestedFix } : null;
     if (!patch) { notify('Check the source bill before applying this correction.', 'error'); return; }
     const corrected = { ...invoice, ...patch, status: 'review', confirmed: false };
     updateInvoice(invoice.id, corrected);
@@ -265,15 +498,55 @@ export default function App() {
     recordAction(replay, 'Ran document safety replay', 'Synthetic instruction-like text was treated as untrusted bill content and quarantined.');
     notify('Safety replay ready. The embedded text cannot change totals or approve a bill.');
   };
-  const exportDraft = () => {
+  const downloadBackendExports = async (records, format) => {
+    let downloaded = 0;
+    const errors = [];
+    for (const invoice of records) {
+      if (!invoice.backendInvoiceId) {
+        errors.push(`${invoice.no}: no backend invoice ID is available.`);
+        continue;
+      }
+      try {
+        const artifact = format === 'json'
+          ? await exportInvoiceJson(invoice.backendInvoiceId)
+          : await exportInvoiceCsv(invoice.backendInvoiceId);
+        downloadBlob(artifact.blob, artifact.filename || backendExportFilename(invoice, format));
+        downloaded += 1;
+      } catch (error) {
+        const detail = error instanceof ApiError && error.detail ? ` ${error.detail}` : '';
+        errors.push(`${invoice.no}: ${error.message || 'Backend export failed.'}${detail}`);
+      }
+    }
+    return { downloaded, errors };
+  };
+  const exportDraft = async () => {
     const periodInvoices = invoices.filter(item => invoiceInPeriod(item, profile.period));
-    const eligible = periodInvoices.filter(item => item.direction !== 'purchase' && item.status === 'ready' && item.confirmed);
-    if (!eligible.length) { notify(`Confirm at least one sales record dated in ${profile.period} before creating the draft.`, 'error'); goTo('attention'); return; }
-    const draft = makeGstr1Draft(periodInvoices, profile, profile.period);
-    const filename = `GSTR1_Draft_${draft.fp}_${profile.gstin || 'GSTIN'}.json`;
-    downloadText(JSON.stringify(draft, null, 2), 'application/json', filename);
-    recordAction(null, 'Generated GSTR-1 draft', `${eligible.length} confirmed outward sales record(s).`);
-    notify(`Draft downloaded with ${eligible.length} confirmed outward records. Validate it in the official utility.`);
+    const backendRecords = periodInvoices.filter(item => item.direction !== 'purchase' && item.validationAuthority === 'backend');
+    const localPeriodInvoices = periodInvoices.filter(item => item.validationAuthority !== 'backend');
+    const localEligible = localPeriodInvoices.filter(item => item.direction !== 'purchase' && item.status === 'ready' && item.confirmed);
+    if (!localEligible.length && !backendRecords.length) { notify(`Confirm at least one sales record dated in ${profile.period} before creating the draft.`, 'error'); goTo('attention'); return; }
+    const backendResult = await downloadBackendExports(backendRecords, 'json');
+    let localDownloaded = false;
+    if (localEligible.length) {
+      const draft = makeGstr1Draft(localPeriodInvoices, profile, profile.period);
+      const filename = `GSTR1_Draft_${draft.fp}_${profile.gstin || 'GSTIN'}.json`;
+      downloadText(JSON.stringify(draft, null, 2), 'application/json', filename);
+      localDownloaded = true;
+      recordAction(null, 'Generated GSTR-1 draft', `${localEligible.length} confirmed offline/manual outward sales record(s).`);
+    }
+    if (backendResult.downloaded) {
+      recordAction(null, 'Downloaded backend GSTR-1 exports', `${backendResult.downloaded} invoice JSON export(s).`);
+    }
+    if (backendResult.errors.length) {
+      const failure = backendResult.errors.slice(0, 3).join(' ');
+      notify(`${backendResult.downloaded + Number(localDownloaded)} export file(s) downloaded; backend export failed: ${failure}`, 'error');
+    } else if (backendResult.downloaded && localDownloaded) {
+      notify(`${backendResult.downloaded} backend JSON export(s) and the offline/manual draft were downloaded.`);
+    } else if (backendResult.downloaded) {
+      notify(`${backendResult.downloaded} backend JSON export(s) downloaded.`);
+    } else {
+      notify(`Draft downloaded with ${localEligible.length} confirmed offline/manual outward records. Validate it in the official utility.`);
+    }
   };
   const exportWorkbook = async () => {
     const buffer = await makeCAWorkbook(invoices, profile, audit);
@@ -281,13 +554,28 @@ export default function App() {
     recordAction(null, 'Generated CA review pack', `${invoices.length} record(s), activity log included.`);
     notify('CA review workbook downloaded. Purchase bills are clearly marked ITC unverified.');
   };
-  const exportCSV = () => {
+  const exportCSV = async () => {
+    const backendRecords = invoices.filter(item => item.validationAuthority === 'backend');
+    const localInvoices = invoices.filter(item => item.validationAuthority !== 'backend');
+    const backendResult = await downloadBackendExports(backendRecords, 'csv');
     const columns = ['invoice_no','date','buyer','buyer_gstin','taxable_value','cgst','sgst','igst','cess','tax','invoice_total','place_of_supply','return_bucket','status','source','review_notes'];
     const esc = value => { let text = String(value ?? ''); if (/^[=+@\-]/.test(text)) text = `'${text}`; return `"${text.replaceAll('"','""')}"`; };
-    const rows = invoices.map(invoice => [invoice.no, invoice.isoDate || invoice.date, invoice.party, invoice.gstin, invoice.amount, invoice.cgst, invoice.sgst, invoice.igst, invoice.cess, invoice.tax, invoice.totalWritten, invoice.pos, invoice.bucket, invoice.status, invoice.source, invoice.issues.join('; ')]);
-    downloadText(`\uFEFF${[columns, ...rows].map(row => row.map(esc).join(',')).join('\r\n')}`, 'text/csv;charset=utf-8', 'BillSetu_records.csv');
-    recordAction(null, 'Exported records CSV', `${invoices.length} records.`);
-    notify('CSV downloaded. Formula-like cells are escaped.');
+    let localDownloaded = false;
+    if (localInvoices.length || !backendRecords.length) {
+      const rows = localInvoices.map(invoice => [invoice.no, invoice.isoDate || invoice.date, invoice.party, invoice.gstin, invoice.amount, invoice.cgst, invoice.sgst, invoice.igst, invoice.cess, invoice.tax, invoice.totalWritten, invoice.pos, invoice.bucket, invoice.status, invoice.source, invoice.issues.join('; ')]);
+      downloadText(`\uFEFF${[columns, ...rows].map(row => row.map(esc).join(',')).join('\r\n')}`, 'text/csv;charset=utf-8', 'BillSetu_records.csv');
+      localDownloaded = true;
+    }
+    if (backendResult.downloaded || localDownloaded) {
+      recordAction(null, 'Exported records CSV', `${backendResult.downloaded} backend invoice export(s); ${localInvoices.length} offline/manual record(s).`);
+    }
+    if (backendResult.errors.length) {
+      const failure = backendResult.errors.slice(0, 3).join(' ');
+      notify(`${backendResult.downloaded + Number(localDownloaded)} export file(s) downloaded; backend export failed: ${failure}`, 'error');
+    } else {
+      const offlineCount = localDownloaded ? localInvoices.length : 0;
+      notify(`${backendResult.downloaded} backend CSV export(s) and ${offlineCount} offline/manual record export(s) downloaded.`);
+    }
   };
   const saveProfile = () => {
     const gstin = String(profileDraft.gstin || '').trim().toUpperCase();
@@ -297,7 +585,7 @@ export default function App() {
     const next = { ...profileDraft, gstin, state, hsnDigits: profileDraft.turnover === 'over-5cr' ? 6 : 4 };
     setProfile(next); setProfileDraft(next); setProfileEditing(false);
     if (next.period !== profile.period) setInvoices(previous => previous.map(item => {
-      if (item.direction === 'purchase') return item;
+      if (item.direction === 'purchase' || item.validationAuthority === 'backend') return item;
       const findings = runGSTChecks(item, next, previous);
       if (invoiceInPeriod(item, next.period) && item.confirmed && item.status === 'ready') return item;
       return { ...item, confirmed: false, status: deriveInvoiceStatus(findings, false), issues: findings.filter(finding => ['error', 'warning'].includes(finding.severity)).map(finding => finding.label) };
@@ -351,7 +639,7 @@ export default function App() {
         {view==='help'&&<HelpView goTo={goTo} runDemo={runDemo} runInjectionDemo={runInjectionDemo}/>}
         {view==='settings'&&<SettingsView profile={profile} draft={profileDraft} setDraft={setProfileDraft} editing={profileEditing} setEditing={setProfileEditing} saveProfile={saveProfile} preferences={preferences} setPreferences={setPreferences} resetWorkspace={resetWorkspace} audit={audit}/>}
       </div>
-      <footer className="footer-v2"><span>© 2026 BillSetu</span><span>Local preparation workspace · Nothing is filed automatically</span><button onClick={()=>goTo('help')}>How it works</button><b className="offline-tag"><span/> OFFLINE REPLAY</b></footer>
+      <footer className="footer-v2"><span>© 2026 BillSetu</span><span>Local preparation workspace · Nothing is filed automatically</span><button onClick={()=>goTo('help')}>How it works</button><b className="offline-tag"><span/> {backendState==='connected'?'BACKEND CONNECTED':backendState==='checking'?'CHECKING BACKEND':'OFFLINE REPLAY'}</b></footer>
       <input ref={fileInput} type="file" className="hidden-input" accept="image/jpeg,image/png,image/webp,application/pdf,.csv,.xlsx" multiple onChange={handleFileChange}/>
     </main>
 
@@ -388,8 +676,38 @@ function InvoiceTable({ invoices, openInvoice, onDelete }) {
 }
 
 function ReportsView({ invoices, profile, issueCount, readyCount, exportDraft, exportWorkbook, exportCSV, openInvoice, goTo }) {
-  const ready = invoices.filter(item=>item.status==='ready'&&item.confirmed&&item.direction!=='purchase');
-  return <section className="page-v2"><div className="page-intro-v2"><div><span className="eyebrow-v2">YOUR RECORDS, YOUR WAY</span><h1>Prepare a reviewable draft.</h1><p>Choose a file for your next step. The exports are generated from the records saved in this browser.</p></div></div><div className="export-readiness-v2"><span className="export-readiness-icon"><ShieldCheck size={21}/></span><div><b>{readyCount} confirmed outward records · {issueCount} still need review</b><small>Only confirmed sales appear in the GSTR-1 draft. Purchases are separated and ITC is not verified.</small></div><button className="button-v2 secondary-v2" onClick={()=>goTo('attention')} disabled={!issueCount}>Review queue</button></div><div className="exports-grid-v2"><ExportCard icon={FileCheck2} eyebrow="PREPARATION DRAFT" title="GSTR-1 JSON" body={`${ready.length} confirmed outward sales record${ready.length===1?'':'s'} will be grouped into a local draft structure.`} items={['Confirmed sales only','B2B, B2CL and B2CS grouping','No filing or GSTN upload occurs']} button="Download JSON draft" onClick={exportDraft}/><ExportCard icon={FileSpreadsheet} eyebrow="FOR YOUR CA" title="CA review workbook" body="A multi-sheet Excel pack for review, with a separate queue for incomplete records and purchases." items={['All records and review notes','Local activity history included','Purchases marked ITC unverified']} button="Download Excel pack" onClick={exportWorkbook}/><ExportCard icon={ClipboardList} eyebrow="SIMPLE REGISTER" title="CSV record list" body="A lightweight copy of every record for your own working files." items={['All record states included','Formula-like values escaped','UTF-8 Indian currency data']} button="Download CSV" onClick={exportCSV}/></div><div className="legal-note-v2"><ShieldCheck size={18}/><span><b>Review boundary</b><small>The JSON is a prototype preparation draft, not schema-certified against the current official offline utility. Validate it with the official GST utility and your CA before use. BillSetu never files a return or verifies ITC.</small></span></div><RecordsTable invoices={invoices.filter(item=>item.status!=='ready').slice(0,5)} title="Records left out of the draft" subtitle="Resolve or escalate these items to include them." onOpen={openInvoice} onAll={()=>goTo('attention')}/></section>;
+  const ready = invoices.filter(item=>item.validationAuthority!=='backend'&&item.status==='ready'&&item.confirmed&&item.direction!=='purchase');
+  const backendRecords = invoices.filter(item => item.validationAuthority === 'backend' && item.backendValidation);
+  return <section className="page-v2">
+    <div className="page-intro-v2"><div><span className="eyebrow-v2">YOUR RECORDS, YOUR WAY</span><h1>Prepare a reviewable draft.</h1><p>Local drafts use browser-saved records. Backend-processed invoices export from the backend; local review corrections are not included.</p></div></div>
+    <BackendGstr1Results invoices={backendRecords}/>
+    <div className="export-readiness-v2"><span className="export-readiness-icon"><ShieldCheck size={21}/></span><div><b>{readyCount} confirmed outward records · {issueCount} still need review</b><small>Only confirmed sales appear in the GSTR-1 draft. Purchases are separated and ITC is not verified.</small></div><button className="button-v2 secondary-v2" onClick={()=>goTo('attention')} disabled={!issueCount}>Review queue</button></div>
+    <div className="exports-grid-v2"><ExportCard icon={FileCheck2} eyebrow="PREPARATION DRAFT" title="GSTR-1 JSON" body={`${ready.length} confirmed outward sales record${ready.length===1?'':'s'} will be grouped into a local draft structure.`} items={['Confirmed sales only','B2B, B2CL and B2CS grouping','No filing or GSTN upload occurs']} button="Download JSON draft" onClick={exportDraft}/><ExportCard icon={FileSpreadsheet} eyebrow="FOR YOUR CA" title="CA review workbook" body="A multi-sheet Excel pack for review, with a separate queue for incomplete records and purchases." items={['All records and review notes','Local activity history included','Purchases marked ITC unverified']} button="Download Excel pack" onClick={exportWorkbook}/><ExportCard icon={ClipboardList} eyebrow="SIMPLE REGISTER" title="CSV record list" body="A lightweight copy of every record for your own working files." items={['All record states included','Formula-like values escaped','UTF-8 Indian currency data']} button="Download CSV" onClick={exportCSV}/></div>
+    <div className="legal-note-v2"><ShieldCheck size={18}/><span><b>Review boundary</b><small>The JSON is a prototype preparation draft, not schema-certified against the current official offline utility. Validate it with the official GST utility and your CA before use. BillSetu never files a return or verifies ITC.</small></span></div><RecordsTable invoices={invoices.filter(item=>item.status!=='ready').slice(0,5)} title="Records left out of the draft" subtitle="Resolve or escalate these items to include them." onOpen={openInvoice} onAll={()=>goTo('attention')}/>
+  </section>;
+}
+
+function BackendGstr1Results({ invoices }) {
+  if (!invoices.length) return null;
+  return <section className="panel-v2 activity-panel-v2">
+    <div className="panel-heading-v2"><div><span className="eyebrow-v2">BACKEND-PROCESSED INVOICES</span><h2>Authoritative backend GSTR-1 results</h2><p>Results are displayed as returned by the backend. The local JSON draft below remains unchanged.</p></div></div>
+    <div className="table-wrap-v2"><table className="data-table-v2">
+      <thead><tr><th>Invoice</th><th>Result</th><th>Type</th><th>Date</th><th>Taxable value</th><th>CGST</th><th>SGST</th><th>IGST</th><th>Cess</th><th>Grand total</th><th>Lines</th><th>Full response</th></tr></thead>
+      <tbody>{invoices.map(invoice => {
+        const result = invoice.backendGstr1;
+        const status = invoice.backendGstr1Status === 'available' ? 'Available' : invoice.backendGstr1Status === 'unavailable' ? 'Unavailable' : 'Loading';
+        return <tr key={invoice.id}>
+          <td><b>{invoice.invoiceNumber || result?.invoice_number || 'Invoice'}</b><small>{invoice.supplierGstin || result?.supplier_gstin || ''}</small></td>
+          <td>{status}{invoice.backendGstr1Error&&<small>{invoice.backendGstr1Error}</small>}</td>
+          {result ? <>
+            <td>{result.invoice_type}</td><td>{result.invoice_date}</td>
+            <td>{money(result.taxable_value)}</td><td>{money(result.cgst_total)}</td><td>{money(result.sgst_total)}</td><td>{money(result.igst_total)}</td><td>{money(result.cess_total)}</td><td>{money(result.grand_total)}</td>
+            <td>{result.line_items.length}</td><td><details><summary>View response</summary><pre>{JSON.stringify(result, null, 2)}</pre></details></td>
+          </> : <td colSpan="10">No backend GSTR-1 record is available. The invoice and backend validation result are retained.</td>}
+        </tr>;
+      })}</tbody>
+    </table></div>
+  </section>;
 }
 function ExportCard({ icon:Icon,eyebrow,title,body,items,button,onClick }) { return <article className="export-card-v2"><span className="export-icon-v2"><Icon size={22}/></span><span className="eyebrow-v2">{eyebrow}</span><h3>{title}</h3><p>{body}</p><ul>{items.map(item=><li key={item}><Check size={14}/>{item}</li>)}</ul><button className="button-v2 primary-v2" onClick={onClick}><Download size={16}/>{button}</button></article>; }
 
@@ -404,20 +722,84 @@ function FormField({label,value,disabled,onChange,type='text'}) { return <label 
 
 function ReviewModal({ invoice,profile,invoices,findings,language,onClose,onSave,onConfirm,onEscalate,onApply,onUpdate,onAudit }) {
   const [tab,setTab]=useState('review');
+  const hasBackendRecord=Boolean(invoice.backendInvoiceId||invoice.backendDocumentId);
+  const backendSourceMissing=hasBackendRecord&&!invoice.backendDocumentId;
+  const [backendAudit,setBackendAudit]=useState({key:'',status:'idle',events:[],error:''});
+  const auditRequests=useRef(new Map());
+  const requestedAuditKeys=useRef(new Set());
+  const backendAuditKey=invoice.backendDocumentId
+    ? `document:${invoice.backendDocumentId}`
+    : invoice.backendInvoiceId
+      ? `invoice:${invoice.backendInvoiceId}`
+      : '';
+  const visibleBackendAudit=backendAudit.key===backendAuditKey&&backendAuditKey
+    ? backendAudit
+    : backendAuditKey
+      ? {status:'idle',events:[],error:''}
+      : {status:'unavailable',events:[],error:'No backend document or invoice identifier is available.'};
+  useEffect(()=>{
+    if(tab!=='history'||invoice.validationAuthority!=='backend')return;
+    if(!backendAuditKey){setBackendAudit({key:'',status:'unavailable',events:[],error:'No backend document or invoice identifier is available.'});return;}
+    if(requestedAuditKeys.current.has(backendAuditKey)&&!auditRequests.current.has(backendAuditKey))return;
+    let request=auditRequests.current.get(backendAuditKey);
+    if(request){return;}
+    requestedAuditKeys.current.add(backendAuditKey);
+    setBackendAudit({key:backendAuditKey,status:'loading',events:[],error:''});
+    request=invoice.backendDocumentId
+      ? getDocumentAudit(invoice.backendDocumentId)
+      : getInvoiceAudit(invoice.backendInvoiceId);
+    auditRequests.current.set(backendAuditKey,request);
+    request.then(response=>{
+      const events=validateBackendAuditEvents(response);
+      setBackendAudit(current=>current.key===backendAuditKey
+        ? {key:backendAuditKey,status:'available',events,error:''}
+        : current);
+    }).catch(error=>{
+      const message=error instanceof ApiError&&error.detail
+        ? error.detail
+        : error.message||'The backend audit request failed.';
+      setBackendAudit(current=>current.key===backendAuditKey
+        ? {key:backendAuditKey,status:'unavailable',events:[],error:message}
+        : current);
+    }).then(()=>auditRequests.current.delete(backendAuditKey));
+  },[tab,invoice.validationAuthority,invoice.backendDocumentId,invoice.backendInvoiceId,backendAuditKey]);
   const patch = (key,value) => { setAdvisoryAck(false);const next={...invoice,[key]:value,confirmed:false};if(['cgst','sgst','igst','cess'].includes(key))next.taxHeadsCaptured=true;if(['gstin','pos','posStateCode','amount','tax','totalWritten','party','buyerAddress','hsn','no','isoDate','bucket'].includes(key))next.bucket=getBucket(next,profile);onUpdate(next); };
   const repair = suggestGSTINRepairs(invoice.gstin)[0];
   const blockers=findings.filter(item=>item.severity==='error');
   const advisories=findings.filter(item=>item.severity==='warning');
   const allClear=blockers.length===0;
   const [advisoryAck,setAdvisoryAck]=useState(false);
-  const canConfirm=allClear&&(advisories.length===0||advisoryAck);
+  const backendCanConfirm=invoice.validationAuthority!=='backend'||(!invoice.backendValidationStale&&invoice.backendValidation?.status==='validated'&&invoice.backendValidation.export_ready===true);
+  const canConfirm=allClear&&(advisories.length===0||advisoryAck)&&backendCanConfirm;
+  const confirmLabel=canConfirm?'Confirm record':invoice.validationAuthority==='backend'&&invoice.backendValidationStale?'Local edits cannot be confirmed':'Resolve blockers / review advisories';
   const applyTotal=()=>{patch('totalWritten',Number(invoice.amount||0)+Number(invoice.tax||0));onAudit('Applied arithmetic suggestion','Grand total set to taxable value plus tax.');};
-  return <div className="modal-overlay-v2" onMouseDown={event=>event.target===event.currentTarget&&onClose()}><section className="review-modal-v2" role="dialog" aria-modal="true" aria-labelledby="review-heading"><header className="review-top-v2"><button className="back-button-v2" onClick={onClose}><ArrowLeft size={16}/> Back to records</button><span className="local-pill-v2"><HardDrive size={13}/> LOCAL REVIEW</span><button className="icon-v2" onClick={onClose} aria-label="Close review"><X size={19}/></button></header><div className="review-body-v2"><div className="review-heading-v2"><div><span className="eyebrow-v2">{invoice.kind?.toUpperCase()||'INVOICE'} · {fmtDate(invoice.isoDate||invoice.date)}</span><h2 id="review-heading">{invoice.no}</h2><p>{invoice.source} <span>·</span> {invoice.source === 'Manual entry' ? 'Entered manually' : <>Capture signal: <b className={invoice.confidence<60?'confidence-low-v2':''}>{invoice.confidence ?? 0}%</b></>}</p></div><span className={`status-v2 ${invoice.status}`}><i/>{statusName(invoice.status)}</span></div><div className="review-tabs-v2"><button className={tab==='review'?'active':''} onClick={()=>setTab('review')}>Review & fix <i>{blockers.length+advisories.length}</i></button><button className={tab==='checks'?'active':''} onClick={()=>setTab('checks')}>12 checks <i>{findings.filter(item=>item.severity==='pass').length}/12</i></button><button className={tab==='history'?'active':''} onClick={()=>setTab('history')}>Source & evidence</button></div>
-    {tab==='review'&&<div className="review-columns-v2"><aside className="source-pane-v2"><div className="source-heading-v2"><FileText size={17}/><div><b>Original bill</b><small>Compare each extracted value to this source</small></div></div><div className="source-canvas-v2">{invoice.fileUrl?(invoice.kind==='PDF invoice'?<iframe src={invoice.fileUrl} title="Uploaded invoice PDF"/>:<img src={invoice.fileUrl} alt="Uploaded invoice"/>):<div className="demo-invoice-v2"><div className="demo-invoice-brand">{invoice.supplier||profile.name}<small>TAX INVOICE</small></div><hr/><p>Invoice no. <b>{invoice.no}</b></p><p>Invoice date <b>{fmtDate(invoice.isoDate||invoice.date)}</b></p><p>Buyer GSTIN <b className={gstinChecksumValid(invoice.gstin)?'':'bad-text-v2'}>{invoice.gstin}</b></p><hr/><p>Taxable value <b>{money(invoice.amount)}</b></p><p>Tax <b>{money(invoice.tax)}</b></p><p className="paper-total-v2">Total on bill <b>{money(invoice.totalWritten)}</b></p></div>}</div><p className="source-caption-v2">{invoice.fileUrl?'Uploaded source is shown from local browser storage.':'Synthetic or register-only record. No bill image was supplied.'}</p><button className="source-open-v2" disabled={!invoice.fileUrl} onClick={()=>window.open(invoice.fileUrl,'_blank','noopener,noreferrer')}>Open source in new tab <ArrowRight size={14}/></button></aside>
-    <section className="fields-pane-v2"><div className="pane-title-v2"><div><h3>Check the details</h3><p>Correct a field if it does not match the bill.</p></div><span className={`confidence-badge-v2 ${invoice.confidence>=85?'high':invoice.confidence>=60?'medium':'low'}`}>{invoice.source==='Manual entry'?'MANUAL ENTRY':`${invoice.confidence>=85?'HIGH':invoice.confidence>=60?'CHECK':'LOW'} CAPTURE SIGNAL`}</span></div><div className="review-form-v2"><FormField label="Invoice number" value={invoice.no} onChange={value=>patch('no',value)}/><FormField label="Invoice date" type="date" value={invoice.isoDate||''} onChange={value=>patch('isoDate',value)}/><FormField label="Customer / buyer" value={invoice.party} onChange={value=>patch('party',value)}/><div className="form-field-v2"><span>Buyer GSTIN</span><input className={!gstinChecksumValid(invoice.gstin)&&invoice.gstin!=='Unregistered'?'input-error-v2':''} value={invoice.gstin} onChange={event=>patch('gstin',event.target.value.toUpperCase())}/>{repair&&<button className="inline-suggestion-v2" onClick={()=>{patch('gstin',repair);onAudit('Applied GSTIN suggestion',`${invoice.gstin} → ${repair}`);}}><Sparkles size={13}/> Suggested checksum match: {repair} · Use</button>}</div><FormField label="Buyer address (when required)" value={invoice.buyerAddress||''} onChange={value=>patch('buyerAddress',value)}/><label className="form-field-v2"><span>Place of supply</span><select value={invoice.posStateCode||stateCodeFor(invoice.pos)||''} onChange={event=>{setAdvisoryAck(false);const code=event.target.value;onUpdate({...invoice,posStateCode:code,pos:STATE_CODES[code]||'',confirmed:false,bucket:getBucket({...invoice,posStateCode:code,pos:STATE_CODES[code]||''},profile)});}}><option value="">Choose state</option>{Object.entries(STATE_CODES).map(([code,state])=><option key={code} value={code}>{code} · {state}</option>)}</select></label><FormField label="Taxable value (₹)" type="number" value={invoice.amount} onChange={value=>patch('amount',Number(value))}/><FormField label="Total tax (₹)" type="number" value={invoice.tax} onChange={value=>patch('tax',Number(value))}/><FormField label="CGST (₹)" type="number" value={invoice.cgst??''} onChange={value=>patch('cgst',Number(value))}/><FormField label="SGST (₹)" type="number" value={invoice.sgst??''} onChange={value=>patch('sgst',Number(value))}/><FormField label="IGST (₹)" type="number" value={invoice.igst??''} onChange={value=>patch('igst',Number(value))}/><FormField label="Cess (₹)" type="number" value={invoice.cess??''} onChange={value=>patch('cess',Number(value))}/><FormField label="Grand total on bill (₹)" type="number" value={invoice.totalWritten} onChange={value=>patch('totalWritten',Number(value))}/><FormField label="HSN / SAC" value={invoice.hsn||''} onChange={value=>patch('hsn',value)}/></div><div className="math-strip-v2"><span>Expected total <b>{money(Number(invoice.amount||0)+Number(invoice.tax||0))}</b></span><b className={Math.abs(Number(invoice.totalWritten||0)-Number(invoice.amount||0)-Number(invoice.tax||0))>1?'math-error-v2':'math-ok-v2'}>{Math.abs(Number(invoice.totalWritten||0)-Number(invoice.amount||0)-Number(invoice.tax||0))>1?`${money(Math.abs(Number(invoice.totalWritten||0)-Number(invoice.amount||0)-Number(invoice.tax||0)))} difference`:'Total matches'}</b>{Math.abs(Number(invoice.totalWritten||0)-Number(invoice.amount||0)-Number(invoice.tax||0))>1&&<button onClick={applyTotal}>Use calculated total</button>}</div><div className="fix-list-v2"><h4>What needs a look</h4>{findings.filter(item=>item.severity==='error'||item.severity==='warning').map(finding=><div className={`finding-v2 ${finding.severity}`} key={finding.id}><span>{finding.severity==='error'?<CircleAlert size={17}/>:<HelpCircle size={17}/>}</span><div><b>{finding.label}</b><p>{language==='hi'?`${finding.message} इसे बिल/CA से जाँचें।`:finding.message}</p><small>{finding.suggestedFix?`Suggested next step: ${finding.suggestedFix}`:'Verify this with the original bill.'}</small></div>{finding.suggestedFix&&((finding.id==='R01'&&finding.field==='gstin'&&gstinChecksumValid(finding.suggestedFix))||finding.id==='R03'||finding.id==='R10')&&<button onClick={()=>{setAdvisoryAck(false);onApply(finding);}}>Apply</button>}</div>)}{!findings.some(item=>item.severity==='error'||item.severity==='warning')&&<div className="all-clear-v2"><CheckCircle2 size={18}/> No blocking findings. Your confirmation is still required.</div>}</div>{advisories.length>0&&<label className="advisory-ack-v2"><input type="checkbox" checked={advisoryAck} onChange={event=>setAdvisoryAck(event.target.checked)}/><span>I checked the advisory against the bill and accept responsibility for confirming this record.</span></label>}</section></div>}
-    {tab==='checks'&&<div className="checks-pane-v2"><div className="checks-summary-v2"><ShieldCheck size={20}/><div><b>{blockers.length?`${blockers.length} blocking item${blockers.length===1?'':'s'}`:advisories.length?`${advisories.length} advisory item${advisories.length===1?'':'s'}`:'No blocking findings'}</b><small>Checks run in your browser from the fields shown. No AI decides totals or approves a record.</small></div></div><div className="checks-grid-v2">{findings.map(item=><article className={`check-card-v2 ${item.severity}`} key={item.id}><span className="check-state-v2">{item.severity==='pass'?<Check size={15}/>:item.severity==='error'?<X size={15}/>:item.severity==='warning'?<CircleAlert size={15}/>:<MoreHorizontal size={15}/>}</span><div><small>{item.id}</small><b>{item.label}</b><p>{item.message}</p></div><i>{item.severity==='pass'?'Passed':item.severity==='error'?'Fix needed':item.severity==='warning'?'Review':'Not applicable / missing data'}</i></article>)}</div></div>}
-    {tab==='history'&&<div className="evidence-pane-v2"><h3>Source evidence & limitations</h3><p><b>Original file:</b> {invoice.source}</p><p><b>Capture signal:</b> {invoice.source === 'Manual entry' ? 'Entered manually' : `${invoice.confidence}% OCR clarity estimate; not a calibrated probability.`}</p><p><b>Extracted text:</b></p><pre>{invoice.rawText||'No OCR text is available for this manually entered or synthetic record.'}</pre><p>Text from a document is treated only as data. Instructions printed inside bills are never executed. Any suspicious instruction-like text is quarantined by R12.</p></div>}
-    </div><footer className="review-footer-v2"><div className="review-disclaimer-v2"><ShieldCheck size={16}/><span>Draft preparation only · Active GSTIN, legal classification and ITC require separate verification.</span></div><div className="review-footer-actions-v2"><button className="button-v2 secondary-v2" onClick={()=>onSave(invoice)}>Save for later</button><button className="button-v2 secondary-v2" onClick={onEscalate}>Flag for CA</button>{invoice.direction==='purchase'?<span className="purchase-note-v2">Purchase record · ITC unverified · outside GSTR-1</span>:<button className="button-v2 primary-v2" disabled={!canConfirm} onClick={onConfirm}><CheckCheck size={16}/>{canConfirm?'Confirm record':'Resolve blockers / review advisories'}</button>}</div></footer></section></div>;
+  return <div className="modal-overlay-v2" onMouseDown={event=>event.target===event.currentTarget&&onClose()}><section className="review-modal-v2" role="dialog" aria-modal="true" aria-labelledby="review-heading"><header className="review-top-v2"><button className="back-button-v2" onClick={onClose}><ArrowLeft size={16}/> Back to records</button><span className="local-pill-v2"><HardDrive size={13}/> {invoice.validationAuthority==='backend'?'BACKEND VALIDATION':'LOCAL REVIEW'}</span><button className="icon-v2" onClick={onClose} aria-label="Close review"><X size={19}/></button></header><div className="review-body-v2"><div className="review-heading-v2"><div><span className="eyebrow-v2">{invoice.kind?.toUpperCase()||'INVOICE'} · {fmtDate(invoice.isoDate||invoice.date)}</span><h2 id="review-heading">{invoice.no}</h2><p>{invoice.source} <span>·</span> {invoice.source === 'Manual entry' ? 'Entered manually' : <>Capture signal: <b className={invoice.confidence<60?'confidence-low-v2':''}>{invoice.confidence ?? 0}%</b></>}</p></div><span className={`status-v2 ${invoice.status}`}><i/>{statusName(invoice.status)}</span></div><div className="review-tabs-v2"><button className={tab==='review'?'active':''} onClick={()=>setTab('review')}>Review & fix <i>{blockers.length+advisories.length}</i></button><button className={tab==='checks'?'active':''} onClick={()=>setTab('checks')}>{invoice.validationAuthority==='backend'?'Backend result':'12 checks'} <i>{invoice.validationAuthority==='backend'?findings.length:`${findings.filter(item=>item.severity==='pass').length}/12`}</i></button><button className={tab==='history'?'active':''} onClick={()=>setTab('history')}>Source & evidence</button></div>
+    {tab==='review'&&<div className="review-columns-v2"><aside className="source-pane-v2"><div className="source-heading-v2"><FileText size={17}/><div><b>Original bill</b><small>Compare each extracted value to this source</small></div></div><div className="source-canvas-v2">{invoice.fileUrl?(invoice.sourceMediaType==='application/pdf'||invoice.kind==='PDF invoice'?<iframe src={invoice.fileUrl} title="Uploaded invoice PDF"/>:<img src={invoice.fileUrl} alt="Uploaded invoice"/>):hasBackendRecord?<div role={invoice.sourcePreviewStatus==='unavailable'||backendSourceMissing?'alert':'status'}>{invoice.sourcePreviewStatus==='unavailable'?`Original source unavailable: ${invoice.sourcePreviewError||'The backend document could not be retrieved.'}`:backendSourceMissing?'Original source document is unavailable.':'Loading original source document…'}</div>:<div className="demo-invoice-v2"><div className="demo-invoice-brand">{invoice.supplier||profile.name}<small>TAX INVOICE</small></div><hr/><p>Invoice no. <b>{invoice.no}</b></p><p>Invoice date <b>{fmtDate(invoice.isoDate||invoice.date)}</b></p><p>Buyer GSTIN <b className={gstinChecksumValid(invoice.gstin)?'':'bad-text-v2'}>{invoice.gstin}</b></p><hr/><p>Taxable value <b>{money(invoice.amount)}</b></p><p>Tax <b>{money(invoice.tax)}</b></p><p className="paper-total-v2">Total on bill <b>{money(invoice.totalWritten)}</b></p></div>}</div><p className="source-caption-v2">{invoice.fileUrl?invoice.sourceMediaType?'Source retrieved from backend document storage.':'Uploaded source is shown from local browser storage.':hasBackendRecord?backendSourceMissing?'Original source document is unavailable.':'Source preview uses the backend document reference.':'Synthetic or register-only record. No bill image was supplied.'}</p><button className="source-open-v2" disabled={!invoice.fileUrl} onClick={()=>window.open(invoice.fileUrl,'_blank','noopener,noreferrer')}>Open source in new tab <ArrowRight size={14}/></button></aside>
+    <section className="fields-pane-v2"><div className="pane-title-v2"><div><h3>Check the details</h3><p>Correct a field if it does not match the bill.</p>{hasBackendRecord&&<p className="small-note-v2" role="note">Local review draft — backend record is unchanged. Validation, GSTR-1 and exports still use backend data.</p>}</div><span className={`confidence-badge-v2 ${invoice.confidence>=85?'high':invoice.confidence>=60?'medium':'low'}`}>{invoice.source==='Manual entry'?'MANUAL ENTRY':`${invoice.confidence>=85?'HIGH':invoice.confidence>=60?'CHECK':'LOW'} CAPTURE SIGNAL`}</span></div><div className="review-form-v2"><FormField label="Invoice number" value={invoice.no} onChange={value=>patch('no',value)}/><FormField label="Invoice date" type="date" value={invoice.isoDate||''} onChange={value=>patch('isoDate',value)}/><FormField label="Customer / buyer" value={invoice.party} onChange={value=>patch('party',value)}/><div className="form-field-v2"><span>Buyer GSTIN</span><input className={!gstinChecksumValid(invoice.gstin)&&invoice.gstin!=='Unregistered'?'input-error-v2':''} value={invoice.gstin} onChange={event=>patch('gstin',event.target.value.toUpperCase())}/>{repair&&<button className="inline-suggestion-v2" onClick={()=>{patch('gstin',repair);onAudit('Applied GSTIN suggestion',`${invoice.gstin} → ${repair}`);}}><Sparkles size={13}/> Suggested checksum match: {repair} · Use</button>}</div><FormField label="Buyer address (when required)" value={invoice.buyerAddress||''} onChange={value=>patch('buyerAddress',value)}/><label className="form-field-v2"><span>Place of supply</span><select value={invoice.posStateCode||stateCodeFor(invoice.pos)||''} onChange={event=>{setAdvisoryAck(false);const code=event.target.value;onUpdate({...invoice,posStateCode:code,pos:STATE_CODES[code]||'',confirmed:false,bucket:getBucket({...invoice,posStateCode:code,pos:STATE_CODES[code]||''},profile)});}}><option value="">Choose state</option>{Object.entries(STATE_CODES).map(([code,state])=><option key={code} value={code}>{code} · {state}</option>)}</select></label><FormField label="Taxable value (₹)" type="number" value={invoice.amount} onChange={value=>patch('amount',Number(value))}/><FormField label="Total tax (₹)" type="number" value={invoice.tax} onChange={value=>patch('tax',Number(value))}/><FormField label="CGST (₹)" type="number" value={invoice.cgst??''} onChange={value=>patch('cgst',Number(value))}/><FormField label="SGST (₹)" type="number" value={invoice.sgst??''} onChange={value=>patch('sgst',Number(value))}/><FormField label="IGST (₹)" type="number" value={invoice.igst??''} onChange={value=>patch('igst',Number(value))}/><FormField label="Cess (₹)" type="number" value={invoice.cess??''} onChange={value=>patch('cess',Number(value))}/><FormField label="Grand total on bill (₹)" type="number" value={invoice.totalWritten} onChange={value=>patch('totalWritten',Number(value))}/><FormField label="HSN / SAC" value={invoice.hsn||''} onChange={value=>patch('hsn',value)}/></div><div className="math-strip-v2"><span>Expected total <b>{money(Number(invoice.amount||0)+Number(invoice.tax||0))}</b></span><b className={Math.abs(Number(invoice.totalWritten||0)-Number(invoice.amount||0)-Number(invoice.tax||0))>1?'math-error-v2':'math-ok-v2'}>{Math.abs(Number(invoice.totalWritten||0)-Number(invoice.amount||0)-Number(invoice.tax||0))>1?`${money(Math.abs(Number(invoice.totalWritten||0)-Number(invoice.amount||0)-Number(invoice.tax||0)))} difference`:'Total matches'}</b>{Math.abs(Number(invoice.totalWritten||0)-Number(invoice.amount||0)-Number(invoice.tax||0))>1&&<button onClick={applyTotal}>Use calculated total</button>}</div><div className="fix-list-v2"><h4>What needs a look</h4>{findings.filter(item=>item.severity==='error'||item.severity==='warning').map(finding=><div className={`finding-v2 ${finding.severity}`} key={finding.id}><span>{finding.severity==='error'?<CircleAlert size={17}/>:<HelpCircle size={17}/>}</span><div><b>{finding.label}</b><p>{language==='hi'?`${finding.message} इसे बिल/CA से जाँचें।`:finding.message}</p><small>{finding.suggestedFix?`Suggested next step: ${finding.suggestedFix}`:'Verify this with the original bill.'}</small></div>{finding.suggestedFix&&((finding.id==='R01'&&finding.field==='gstin'&&gstinChecksumValid(finding.suggestedFix))||finding.id==='R03'||finding.id==='R10')&&<button onClick={()=>{setAdvisoryAck(false);onApply(finding);}}>Apply</button>}</div>)}{!findings.some(item=>item.severity==='error'||item.severity==='warning')&&<div className="all-clear-v2"><CheckCircle2 size={18}/> No blocking findings. Your confirmation is still required.</div>}</div>{advisories.length>0&&<label className="advisory-ack-v2"><input type="checkbox" checked={advisoryAck} onChange={event=>setAdvisoryAck(event.target.checked)}/><span>I checked the advisory against the bill and accept responsibility for confirming this record.</span></label>}</section></div>}
+    {tab==='checks'&&<div className="checks-pane-v2"><div className="checks-summary-v2"><ShieldCheck size={20}/><div><b>{blockers.length?`${blockers.length} blocking item${blockers.length===1?'':'s'}`:advisories.length?`${advisories.length} advisory item${advisories.length===1?'':'s'}`:'No blocking findings'}</b><small>{invoice.validationAuthority==='backend'
+      ? invoice.backendValidation
+        ? `${invoice.backendValidation.summary.headline}: ${invoice.backendValidation.summary.message}${invoice.backendValidationStale?' The result is for the persisted backend invoice; local edits have not been validated by the backend.':''}`
+        : `Authoritative backend validation unavailable: ${invoice.backendValidationError || 'No validation result was returned.'}`
+      : 'Checks run in your browser from the fields shown. No AI decides totals or approves a record.'}</small></div></div><div className="checks-grid-v2">{findings.map(item=><article className={`check-card-v2 ${item.severity}`} key={item.id}><span className="check-state-v2">{item.severity==='pass'?<Check size={15}/>:item.severity==='error'?<X size={15}/>:item.severity==='warning'?<CircleAlert size={15}/>:<MoreHorizontal size={15}/>}</span><div><small>{item.id}</small><b>{item.label}</b><p>{item.message}</p></div><i>{item.severity==='pass'?'Passed':item.severity==='error'?'Fix needed':item.severity==='warning'?'Review':'Not applicable / missing data'}</i></article>)}</div></div>}
+    {tab==='history'&&<div className="evidence-pane-v2">
+      {invoice.validationAuthority==='backend'&&<section>
+        <h3>Backend audit history</h3>
+        {visibleBackendAudit.status==='idle'||visibleBackendAudit.status==='loading'
+          ? <p role="status">Loading backend audit history…</p>
+          : visibleBackendAudit.status==='unavailable'
+            ? <div className="error-banner" role="alert"><span>Backend audit history is unavailable: {visibleBackendAudit.error} Frontend-local history has not been substituted.</span></div>
+            : visibleBackendAudit.events.length
+              ? visibleBackendAudit.events.map(event=><div className="activity-row-v2" key={event.event_id}>
+                <span><History size={15}/></span>
+                <div><b>{event.event_type}</b><small>{event.message}</small><small>Status: {event.status} · Document ID: {event.document_id} · Invoice ID: {String(event.invoice_id)}</small>
+                  <details><summary>Full event details</summary><pre>{JSON.stringify(event,null,2)}</pre></details>
+                </div>
+                <time dateTime={event.created_at}>{new Date(event.created_at).toLocaleString('en-IN')}</time>
+              </div>)
+              : <p>The backend returned no audit events for this record.</p>}
+      </section>}
+      <h3>Source evidence & limitations</h3><p><b>Original file:</b> {invoice.source}</p><p><b>Capture signal:</b> {invoice.source === 'Manual entry' ? 'Entered manually' : `${invoice.confidence}% OCR clarity estimate; not a calibrated probability.`}</p><p><b>Extracted text:</b></p><pre>{invoice.rawText||'No OCR text is available for this manually entered or synthetic record.'}</pre><p>Text from a document is treated only as data. Instructions printed inside bills are never executed. Any suspicious instruction-like text is quarantined by R12.</p></div>}
+    </div><footer className="review-footer-v2"><div className="review-disclaimer-v2"><ShieldCheck size={16}/><span>Draft preparation only · Active GSTIN, legal classification and ITC require separate verification.</span></div><div className="review-footer-actions-v2"><button className="button-v2 secondary-v2" onClick={()=>onSave(invoice)}>Save for later</button><button className="button-v2 secondary-v2" onClick={onEscalate}>Flag for CA</button>{invoice.direction==='purchase'?<span className="purchase-note-v2">Purchase record · ITC unverified · outside GSTR-1</span>:<button className="button-v2 primary-v2" disabled={!canConfirm} onClick={onConfirm}><CheckCheck size={16}/>{confirmLabel}</button>}</div></footer></section></div>;
 }
 
 function ManualEntry({ onClose,onSave }) { const [data,setData]=useState({no:'',party:'',gstin:'Unregistered',isoDate:'',amount:'',tax:'',totalWritten:'',posStateCode:'',buyerAddress:'',hsn:'',bucket:'Review'}); const update=(key,value)=>setData(prev=>({...prev,[key]:value})); return <div className="modal-overlay-v2" onMouseDown={event=>event.target===event.currentTarget&&onClose()}><form className="manual-modal-v2" onSubmit={event=>{event.preventDefault();const state=STATE_CODES[data.posStateCode]||'';onSave(makeInvoice({...data,party:data.party||'Buyer to confirm',amount:Number(data.amount)||0,tax:Number(data.tax)||0,totalWritten:Number(data.totalWritten)||Number(data.amount||0)+Number(data.tax||0),pos:state,status:'review',issues:['New manual record — review each field'],confidence:null,isoDate:data.isoDate,date:data.isoDate,source:'Manual entry',kind:'Tax invoice',items:[],cgst:0,sgst:0,igst:0,taxHeadsCaptured:false}));}}><header><span><Plus size={18}/> New bill</span><button type="button" className="icon-v2" onClick={onClose}><X size={18}/></button></header><p>Enter the main details from the source bill. You can correct them in the review step.</p><div className="manual-fields-v2"><FormField label="Invoice number" value={data.no} onChange={value=>update('no',value)}/><FormField label="Invoice date" type="date" value={data.isoDate} onChange={value=>update('isoDate',value)}/><FormField label="Customer / buyer" value={data.party} onChange={value=>update('party',value)}/><FormField label="Buyer GSTIN or Unregistered" value={data.gstin} onChange={value=>update('gstin',value.toUpperCase())}/><FormField label="Taxable value (₹)" type="number" value={data.amount} onChange={value=>update('amount',value)}/><FormField label="Total tax (₹)" type="number" value={data.tax} onChange={value=>update('tax',value)}/><FormField label="Grand total on bill (₹)" type="number" value={data.totalWritten} onChange={value=>update('totalWritten',value)}/><label className="form-field-v2"><span>Place of supply</span><select value={data.posStateCode} onChange={event=>update('posStateCode',event.target.value)}><option value="">Choose state</option>{Object.entries(STATE_CODES).map(([code,state])=><option key={code} value={code}>{code} · {state}</option>)}</select></label></div><footer><button type="button" className="button-v2 secondary-v2" onClick={onClose}>Cancel</button><button className="button-v2 primary-v2" type="submit"><Check size={16}/> Add and review</button></footer></form></div>; }

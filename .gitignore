@@ -9,3 +9,19 @@ dist/
 
 .vercel
 .env*
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+backend/.data/
+_phase1_checkpoint/
+
+# IDE and OS files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp

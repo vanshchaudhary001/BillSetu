@@ -1,8 +1,5 @@
 from datetime import datetime, timezone
-import json
-import os
 from pathlib import Path
-import tempfile
 from uuid import uuid4
 
 from fastapi import HTTPException, UploadFile
@@ -12,10 +9,16 @@ from app.core.config import settings
 from app.core.file_security import read_and_validate, server_filename, suspicious_text
 from app.schemas.documents import DocumentRecord
 from app.services.audit_service import AuditService, record_safely
+from app.storage.json_store import read_json, write_json_atomic
 
 
 class DocumentService:
-    """Private-storage adapter for the milestone; Supabase Storage replaces the local adapter next."""
+    """Private-storage adapter for the milestone; Supabase Storage replaces the local adapter next.
+
+    Every record carries the `business_id` of the business that created it.
+    `business_id = None` marks a legacy record and is treated as inaccessible by
+    the business-scoped lookups below, which is the only path routes use.
+    """
 
     def __init__(self, audit: AuditService | None = None) -> None:
         self.audit = audit
@@ -25,7 +28,12 @@ class DocumentService:
         self._metadata_path = self._root.parent / "documents.json"
         self._load_metadata()
 
-    async def upload(self, upload: UploadFile) -> DocumentRecord:
+    async def upload(
+        self, upload: UploadFile, business_id: str | None = None
+    ) -> DocumentRecord:
+        # Ownership is passed in by the route from the authenticated session; a
+        # request body can never choose the owner.
+        owner_id = business_id
         data, media_type, extension, digest, notes = await read_and_validate(upload)
         if media_type.startswith("image/"):
             try:
@@ -53,7 +61,7 @@ class DocumentService:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(data)
         status = "quarantined" if "suspicious_instruction_text_detected" in notes else "uploaded"
-        record = DocumentRecord(document_id=document_id, filename=upload.filename or "document", media_type=media_type, extension=extension, size_bytes=len(data), sha256=digest, status=status, created_at=datetime.now(timezone.utc), security_notes=notes)
+        record = DocumentRecord(document_id=document_id, filename=upload.filename or "document", media_type=media_type, extension=extension, size_bytes=len(data), sha256=digest, status=status, created_at=datetime.now(timezone.utc), business_id=owner_id, security_notes=notes)
         self._documents[document_id] = record
         self._paths[document_id] = path
         self._persist_metadata()
@@ -63,6 +71,7 @@ class DocumentService:
             status="completed",
             message="Document uploaded and stored under a server-generated name.",
             document_id=document_id,
+            business_id=owner_id,
             metadata={
                 "media_type": media_type,
                 "size_bytes": len(data),
@@ -79,25 +88,67 @@ class DocumentService:
                 else "Security checks completed."
             ),
             document_id=document_id,
+            business_id=owner_id,
             metadata={"security_notes": ", ".join(notes)} if notes else None,
         )
         return record
 
     def get(self, document_id: str) -> DocumentRecord:
-        if document_id not in self._documents:
-            self._load_metadata()
-        if document_id not in self._documents:
+        record = self._record(document_id)
+        if record is None:
             raise KeyError(document_id)
-        return self._documents[document_id]
+        return record
+
+    def get_owned(self, document_id: str, business_id: str) -> DocumentRecord:
+        """Business-scoped lookup: id and owner are resolved as one operation.
+
+        A missing document, a legacy unowned document and a document owned by
+        another business all raise the same `KeyError`, so callers cannot tell
+        them apart and existence is never disclosed before authorization.
+        """
+        record = self._record(document_id)
+        if record is None or not business_id or record.business_id != business_id:
+            raise KeyError(document_id)
+        return record
+
+    def list_owned(self, business_id: str) -> list[DocumentRecord]:
+        """Documents owned by `business_id`; legacy unowned records are excluded."""
+        if not business_id:
+            return []
+        if not self._documents:
+            self._load_metadata()
+        return sorted(
+            (
+                record
+                for record in self._documents.values()
+                if record.business_id == business_id
+            ),
+            key=lambda record: (record.created_at, record.document_id),
+        )
 
     def bytes_for(self, document_id: str) -> bytes:
         self.get(document_id)
         return self._paths[document_id].read_bytes()
 
-    def find_by_invoice(self, invoice_id: str) -> str | None:
+    def bytes_for_owned(self, document_id: str, business_id: str) -> bytes:
+        """Authorize against the record before any bytes are read from disk."""
+        self.get_owned(document_id, business_id)
+        return self._paths[document_id].read_bytes()
+
+    def business_id_for(self, document_id: str) -> str | None:
+        """Owning business of a stored document, or None for a legacy record."""
+        return self.get(document_id).business_id
+
+    def find_by_invoice(
+        self, invoice_id: str, business_id: str | None = None
+    ) -> str | None:
+        """Document linked to an invoice, optionally restricted to one owner."""
         for document_id, record in self._documents.items():
-            if record.invoice_id == invoice_id:
-                return document_id
+            if record.invoice_id != invoice_id:
+                continue
+            if business_id is not None and record.business_id != business_id:
+                continue
+            return document_id
         return None
 
     def mark(self, document_id: str, **changes: object) -> DocumentRecord:
@@ -107,18 +158,19 @@ class DocumentService:
         self._persist_metadata()
         return updated
 
+    def _record(self, document_id: str) -> DocumentRecord | None:
+        if document_id not in self._documents:
+            self._load_metadata()
+        return self._documents.get(document_id)
+
     def _load_metadata(self) -> None:
-        if not self._metadata_path.exists():
-            return
-        with self._metadata_path.open("r", encoding="utf-8") as metadata_file:
-            payload = json.load(metadata_file)
+        payload = read_json(self._metadata_path, {})
         for document_id, entry in payload.items():
             record = DocumentRecord.model_validate(entry["record"])
             self._documents[document_id] = record
             self._paths[document_id] = Path(entry["storage_path"])
 
     def _persist_metadata(self) -> None:
-        self._metadata_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             document_id: {
                 "record": record.model_dump(mode="json"),
@@ -126,24 +178,7 @@ class DocumentService:
             }
             for document_id, record in self._documents.items()
         }
-        temporary_path: str | None = None
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=self._metadata_path.parent,
-                prefix=".documents-",
-                suffix=".tmp",
-                delete=False,
-            ) as temporary_file:
-                temporary_path = temporary_file.name
-                json.dump(payload, temporary_file, ensure_ascii=False, indent=2)
-                temporary_file.flush()
-                os.fsync(temporary_file.fileno())
-            Path(temporary_path).replace(self._metadata_path)
-        finally:
-            if temporary_path and Path(temporary_path).exists():
-                Path(temporary_path).unlink()
+        write_json_atomic(self._metadata_path, payload)
 
     @staticmethod
     def _normalize_image(data: bytes) -> tuple[bytes, list[str]]:

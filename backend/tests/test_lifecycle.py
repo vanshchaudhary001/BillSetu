@@ -20,6 +20,7 @@ from app.services.extraction_service import ExtractionService
 from app.services.gemini_service import GeminiService
 from app.services.validation_engine import ValidationEngine
 from app.validators.r01_gstin import _checksum
+from tests.conftest import own_invoice
 
 
 def gstin(prefix: str = "09ABCDE1234F1Z") -> str:
@@ -103,7 +104,7 @@ class FakeGemini:
 
 
 @pytest.fixture
-def wired(monkeypatch, tmp_path) -> SimpleNamespace:
+def wired(monkeypatch, tmp_path, sign_in) -> SimpleNamespace:
     monkeypatch.setattr(settings, "storage_root", str(tmp_path / "private-documents"))
     audit = AuditService()
     documents = DocumentService(audit=audit)
@@ -113,12 +114,17 @@ def wired(monkeypatch, tmp_path) -> SimpleNamespace:
     monkeypatch.setattr(documents_routes, "audit", audit)
     monkeypatch.setattr(invoices_routes, "extraction", extraction)
     monkeypatch.setattr(invoices_routes, "audit", audit)
+    # Phase 8B-6: record endpoints are business-scoped, so the client runs with
+    # a real session and the business it registered.
+    client = TestClient(app)
+    business_id = sign_in(client)
     return SimpleNamespace(
-        client=TestClient(app),
+        client=client,
         audit=audit,
         documents=documents,
         extraction=extraction,
         tmp_path=tmp_path,
+        business_id=business_id,
     )
 
 
@@ -324,7 +330,7 @@ def test_persistence_failure_does_not_record_success(wired, monkeypatch):
     with pytest.raises(OSError):
         wired.extraction.extract(record["document_id"])
 
-    event_types = [event.event_type for event in wired.audit.list_for_document(record["document_id"])]
+    event_types = [event.event_type for event in wired.audit.list_for_document(record["document_id"], wired.business_id)]
     assert event_types == ["document_uploaded", "security_checked", "extraction_started"]
     assert wired.client.get(f"/api/documents/{record['document_id']}").json()["status"] == "uploaded"
 
@@ -346,13 +352,13 @@ def test_validation_endpoint_keeps_existing_semantics(wired):
     assert payload["issues"] == []
 
 
-def test_validation_reports_review_required_and_blocked(wired):
+def test_validation_reports_review_required_and_blocked(wired, monkeypatch):
     review = invoice()
     review.supplier.name = None
     unreadable = invoice()
     unreadable.document_type = "unreadable"
-    wired.extraction.invoices["inv-review"] = review
-    wired.extraction.invoices["inv-blocked"] = unreadable
+    own_invoice(monkeypatch, wired.extraction, "inv-review", review, wired.business_id)
+    own_invoice(monkeypatch, wired.extraction, "inv-blocked", unreadable, wired.business_id)
 
     review_response = wired.client.post("/api/invoices/inv-review/validate").json()
     blocked_response = wired.client.post("/api/invoices/inv-blocked/validate").json()
@@ -367,10 +373,10 @@ def test_validation_reports_review_required_and_blocked(wired):
 # ----------------------------------------------------------------------- GSTR-1
 
 
-def test_gstr1_copies_values_without_recalculating(wired):
+def test_gstr1_copies_values_without_recalculating(wired, monkeypatch):
     tampered = invoice()
     tampered.line_items[0].cgst_amount = Decimal("9999")
-    wired.extraction.invoices["inv-copy"] = tampered
+    own_invoice(monkeypatch, wired.extraction, "inv-copy", tampered, wired.business_id)
 
     response = wired.client.get("/api/invoices/inv-copy/gstr1")
 
@@ -381,10 +387,10 @@ def test_gstr1_copies_values_without_recalculating(wired):
     assert payload["invoice_type"] == "B2B"
 
 
-def test_gstr1_missing_date_returns_422(wired):
+def test_gstr1_missing_date_returns_422(wired, monkeypatch):
     undated = invoice()
     undated.invoice_date = None
-    wired.extraction.invoices["inv-undated"] = undated
+    own_invoice(monkeypatch, wired.extraction, "inv-undated", undated, wired.business_id)
 
     response = wired.client.get("/api/invoices/inv-undated/gstr1")
 
@@ -449,7 +455,7 @@ def test_repeated_operations_are_consistent(wired):
     assert json_one.content == json_two.content
     assert csv_one.content == csv_two.content
 
-    event_types = [event.event_type for event in wired.audit.list_for_invoice(invoice_id)]
+    event_types = [event.event_type for event in wired.audit.list_for_invoice(invoice_id, wired.business_id)]
     assert event_types.count("export_json_generated") == 1
     assert event_types.count("export_csv_generated") == 1
     assert event_types.count("gstr1_generated") == 1

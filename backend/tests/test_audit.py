@@ -20,6 +20,7 @@ from app.services.document_service import DocumentService
 from app.services.extraction_service import ExtractionService
 from app.services.validation_engine import ValidationEngine
 from app.validators.r01_gstin import _checksum
+from tests.conftest import own_invoice
 
 
 def gstin(prefix: str = "09ABCDE1234F1Z") -> str:
@@ -107,7 +108,7 @@ def test_events_survive_service_reload(audit):
     )
 
     reloaded = AuditService()
-    restored = reloaded.list_for_document("doc-1")
+    restored = reloaded.list_for_document("doc-1", None)
 
     assert [event.event_id for event in restored] == [first.event_id]
     assert restored[0].event_type == "document_uploaded"
@@ -117,8 +118,8 @@ def test_missing_audit_file_behaves_as_empty(tmp_path, monkeypatch):
     monkeypatch.setattr(settings, "storage_root", str(tmp_path / "private-documents"))
     service = AuditService()
 
-    assert service.list_for_document("missing") == []
-    assert service.list_for_invoice("missing") == []
+    assert service.list_for_document("missing", None) == []
+    assert service.list_for_invoice("missing", None) == []
     assert not (tmp_path / "audit_events.json").exists()
 
 
@@ -134,8 +135,8 @@ def test_listing_filters_and_orders_chronologically(audit):
         invoice_id="inv-1",
     )
 
-    document_events = audit.list_for_document("doc-1")
-    invoice_events = audit.list_for_invoice("inv-1")
+    document_events = audit.list_for_document("doc-1", None)
+    invoice_events = audit.list_for_invoice("inv-1", None)
 
     assert [event.event_type for event in document_events] == [
         "document_uploaded",
@@ -152,7 +153,7 @@ def test_upload_records_document_and_security_events(audit):
 
     uploaded = asyncio.run(documents.upload(png_upload()))
 
-    events = audit.list_for_document(uploaded.document_id)
+    events = audit.list_for_document(uploaded.document_id, None)
     assert [event.event_type for event in events] == ["document_uploaded", "security_checked"]
     assert all(event.status == "completed" for event in events)
     assert events[0].metadata["sha256"] == uploaded.sha256
@@ -165,7 +166,7 @@ def test_extraction_records_pipeline_events(audit, tmp_path):
 
     _, invoice_id, validation = pipeline.extract(uploaded.document_id)
 
-    document_events = audit.list_for_document(uploaded.document_id)
+    document_events = audit.list_for_document(uploaded.document_id, None)
     assert [event.event_type for event in document_events] == [
         "document_uploaded",
         "security_checked",
@@ -177,26 +178,30 @@ def test_extraction_records_pipeline_events(audit, tmp_path):
     assert document_events[-1].status == "completed"
     assert validation.status == "validated"
 
-    invoice_events = audit.list_for_invoice(invoice_id)
+    invoice_events = audit.list_for_invoice(invoice_id, None)
     assert [event.event_type for event in invoice_events] == [
         "extraction_completed",
         "validation_completed",
     ]
 
 
-def test_gstr1_generation_records_event(audit, monkeypatch):
+def test_gstr1_generation_records_event(audit, monkeypatch, sign_in):
+    client = TestClient(app)
+    business_id = sign_in(client)
+
     documents = DocumentService(audit=audit)
-    uploaded = asyncio.run(documents.upload(png_upload()))
+    uploaded = asyncio.run(documents.upload(png_upload(), business_id=business_id))
     pipeline = ExtractionService(documents, FakeGemini(), ValidationEngine(), audit=audit)
-    _, invoice_id, _ = pipeline.extract(uploaded.document_id)
+    _, invoice_id, _ = pipeline.extract(uploaded.document_id, business_id=business_id)
 
     monkeypatch.setattr(invoices_routes, "extraction", pipeline)
     monkeypatch.setattr(invoices_routes, "audit", audit)
 
-    record = invoices_routes.get_invoice_gstr1(invoice_id)
+    response = client.get(f"/api/invoices/{invoice_id}/gstr1")
 
-    assert record.invoice_type == "B2B"
-    events = audit.list_for_invoice(invoice_id)
+    assert response.status_code == 200
+    assert response.json()["invoice_type"] == "B2B"
+    events = audit.list_for_invoice(invoice_id, business_id)
     assert events[-1].event_type == "gstr1_generated"
     assert events[-1].status == "completed"
     assert events[-1].metadata["invoice_type"] == "B2B"
@@ -215,7 +220,7 @@ def test_extraction_failure_is_recorded_and_original_exception_preserved(audit):
     with pytest.raises(RuntimeError, match="provider down"):
         pipeline.extract(uploaded.document_id)
 
-    events = audit.list_for_document(uploaded.document_id)
+    events = audit.list_for_document(uploaded.document_id, None)
     assert [event.event_type for event in events] == [
         "document_uploaded",
         "security_checked",
@@ -258,13 +263,16 @@ def test_audit_failure_does_not_mask_extraction_error(audit, monkeypatch):
         pipeline.extract(uploaded.document_id)
 
 
-def test_invoice_audit_endpoint_returns_history(audit, monkeypatch, clean_invoice):
+def test_invoice_audit_endpoint_returns_history(audit, monkeypatch, clean_invoice, sign_in):
+    client = TestClient(app)
+    business_id = sign_in(client)
     audit.record(
         event_type="extraction_completed",
         status="completed",
         message="Canonical invoice created.",
         document_id="doc-1",
         invoice_id="inv-1",
+        business_id=business_id,
     )
     audit.record(
         event_type="validation_completed",
@@ -272,11 +280,12 @@ def test_invoice_audit_endpoint_returns_history(audit, monkeypatch, clean_invoic
         message="Validation finished.",
         document_id="doc-1",
         invoice_id="inv-1",
+        business_id=business_id,
     )
-    monkeypatch.setitem(extraction.invoices, "inv-1", clean_invoice)
+    own_invoice(monkeypatch, extraction, "inv-1", clean_invoice, business_id)
     monkeypatch.setattr(invoices_routes, "audit", audit)
 
-    response = TestClient(app).get("/api/invoices/inv-1/audit")
+    response = client.get("/api/invoices/inv-1/audit")
 
     assert response.status_code == 200
     payload = response.json()
@@ -287,20 +296,25 @@ def test_invoice_audit_endpoint_returns_history(audit, monkeypatch, clean_invoic
     assert payload[0]["created_at"] <= payload[1]["created_at"]
 
 
-def test_unknown_invoice_audit_returns_404():
-    response = TestClient(app).get("/api/invoices/does-not-exist/audit")
+def test_unknown_invoice_audit_returns_404(sign_in):
+    client = TestClient(app)
+    sign_in(client)
+
+    response = client.get("/api/invoices/does-not-exist/audit")
 
     assert response.status_code == 404
     assert response.json() == {"detail": "Invoice not found"}
 
 
-def test_document_audit_endpoint_returns_history(audit, monkeypatch):
+def test_document_audit_endpoint_returns_history(audit, monkeypatch, sign_in):
+    client = TestClient(app)
+    business_id = sign_in(client)
     documents = DocumentService(audit=audit)
-    uploaded = asyncio.run(documents.upload(png_upload()))
+    uploaded = asyncio.run(documents.upload(png_upload(), business_id=business_id))
     monkeypatch.setattr(documents_routes, "documents", documents)
     monkeypatch.setattr(documents_routes, "audit", audit)
 
-    response = TestClient(app).get(f"/api/documents/{uploaded.document_id}/audit")
+    response = client.get(f"/api/documents/{uploaded.document_id}/audit")
 
     assert response.status_code == 200
     assert [event["event_type"] for event in response.json()] == [
@@ -309,8 +323,11 @@ def test_document_audit_endpoint_returns_history(audit, monkeypatch):
     ]
 
 
-def test_unknown_document_audit_returns_404():
-    response = TestClient(app).get("/api/documents/does-not-exist/audit")
+def test_unknown_document_audit_returns_404(sign_in):
+    client = TestClient(app)
+    sign_in(client)
+
+    response = client.get("/api/documents/does-not-exist/audit")
 
     assert response.status_code == 404
     assert response.json() == {"detail": "Document not found"}

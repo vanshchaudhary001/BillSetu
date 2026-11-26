@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from app.api.routes.documents import extraction
 from app.main import app
 from app.services.gstr1_service import GSTR1Service
+from tests.conftest import own_invoice
 
 
 def build(clean_invoice):
@@ -87,17 +88,22 @@ def test_missing_invoice_date_fails_clearly(clean_invoice):
     assert "invoice_date" in str(error.value)
 
 
-def test_unknown_invoice_gstr1_returns_404():
-    response = TestClient(app).get("/api/invoices/does-not-exist/gstr1")
+def test_unknown_invoice_gstr1_returns_404(sign_in):
+    client = TestClient(app)
+    sign_in(client)
+
+    response = client.get("/api/invoices/does-not-exist/gstr1")
 
     assert response.status_code == 404
     assert response.json() == {"detail": "Invoice not found"}
 
 
-def test_gstr1_endpoint_returns_typed_record(monkeypatch, clean_invoice):
-    monkeypatch.setitem(extraction.invoices, "test-invoice", clean_invoice)
+def test_gstr1_endpoint_returns_typed_record(monkeypatch, clean_invoice, sign_in):
+    client = TestClient(app)
+    business_id = sign_in(client)
+    own_invoice(monkeypatch, extraction, "test-invoice", clean_invoice, business_id)
 
-    response = TestClient(app).get("/api/invoices/test-invoice/gstr1")
+    response = client.get("/api/invoices/test-invoice/gstr1")
 
     assert response.status_code == 200
     payload = response.json()

@@ -21,10 +21,13 @@ def png_bytes() -> bytes:
 
 
 @pytest.fixture
-def client(monkeypatch, tmp_path) -> TestClient:
+def client(monkeypatch, tmp_path, sign_in) -> TestClient:
     monkeypatch.setattr(settings, "storage_root", str(tmp_path / "private-documents"))
     monkeypatch.setattr(documents_routes, "documents", DocumentService())
-    return TestClient(app)
+    client = TestClient(app)
+    # Uploads are business-scoped since Phase 8B-6; CORS behaviour is unchanged.
+    sign_in(client)
+    return client
 
 
 def preflight(client: TestClient, path: str, origin: str, method: str, headers: str):
@@ -44,6 +47,7 @@ def test_allowed_origin_receives_cors_headers(client):
     assert response.status_code == 200
     assert response.headers["access-control-allow-origin"] == FRONTEND_ORIGIN
     assert response.headers["access-control-allow-origin"] != "*"
+    assert response.headers["access-control-allow-credentials"] == "true"
 
 
 def test_export_filename_header_is_readable_by_browser(client):
@@ -81,7 +85,7 @@ def test_preflight_succeeds_for_validate_route(client):
     allowed_headers = response.headers["access-control-allow-headers"].lower()
     assert "content-type" in allowed_headers
     assert "authorization" in allowed_headers
-    assert "access-control-allow-credentials" not in response.headers
+    assert response.headers["access-control-allow-credentials"] == "true"
 
 
 def test_unapproved_origin_is_rejected(client):

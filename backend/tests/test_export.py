@@ -22,6 +22,7 @@ from app.services.export_service import CSV_COLUMNS, export_filename
 from app.services.extraction_service import ExtractionService
 from app.services.validation_engine import ValidationEngine
 from app.validators.r01_gstin import _checksum
+from tests.conftest import own_invoice
 
 
 def gstin(prefix: str = "09ABCDE1234F1Z") -> str:
@@ -77,20 +78,22 @@ class FakeGemini:
         return self.value
 
 
-def pipeline_with(audit, extracted=None):
+def pipeline_with(audit, extracted=None, business_id=None):
     documents = DocumentService(audit=audit)
-    uploaded = asyncio.run(documents.upload(png_upload()))
+    uploaded = asyncio.run(documents.upload(png_upload(), business_id=business_id))
     pipeline = ExtractionService(
         documents, FakeGemini(extracted), ValidationEngine(), audit=audit
     )
-    _, invoice_id, _ = pipeline.extract(uploaded.document_id)
+    _, invoice_id, _ = pipeline.extract(uploaded.document_id, business_id=business_id)
     return pipeline, invoice_id
 
 
-def test_json_export_returns_downloadable_record(monkeypatch, clean_invoice):
-    monkeypatch.setitem(extraction.invoices, "inv-json", clean_invoice)
+def test_json_export_returns_downloadable_record(monkeypatch, clean_invoice, sign_in):
+    client = TestClient(app)
+    business_id = sign_in(client)
+    own_invoice(monkeypatch, extraction, "inv-json", clean_invoice, business_id)
 
-    response = TestClient(app).get("/api/invoices/inv-json/export/json")
+    response = client.get("/api/invoices/inv-json/export/json")
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("application/json")
@@ -120,11 +123,13 @@ def test_export_filename_is_sanitized(raw):
     assert "\x00" not in filename
 
 
-def test_csv_export_has_stable_headers_and_values(monkeypatch, clean_invoice):
+def test_csv_export_has_stable_headers_and_values(monkeypatch, clean_invoice, sign_in):
     clean_invoice.line_items[0].description = "LED लाइट"
-    monkeypatch.setitem(extraction.invoices, "inv-csv", clean_invoice)
+    client = TestClient(app)
+    business_id = sign_in(client)
+    own_invoice(monkeypatch, extraction, "inv-csv", clean_invoice, business_id)
 
-    response = TestClient(app).get("/api/invoices/inv-csv/export/csv")
+    response = client.get("/api/invoices/inv-csv/export/csv")
 
     assert response.status_code == 200
     assert response.headers["content-type"].startswith("text/csv")
@@ -152,7 +157,7 @@ def test_csv_export_has_stable_headers_and_values(monkeypatch, clean_invoice):
     assert values["invoice_date"] == "2026-10-14"
 
 
-def test_csv_export_uses_one_row_per_line_item(monkeypatch, clean_invoice):
+def test_csv_export_uses_one_row_per_line_item(monkeypatch, clean_invoice, sign_in):
     clean_invoice.line_items.append(
         LineItem(
             description="Copper Wire",
@@ -169,9 +174,11 @@ def test_csv_export_uses_one_row_per_line_item(monkeypatch, clean_invoice):
     clean_invoice.totals.cgst_total = Decimal("5850")
     clean_invoice.totals.sgst_total = Decimal("5850")
     clean_invoice.totals.grand_total = Decimal("76700")
-    monkeypatch.setitem(extraction.invoices, "inv-multi", clean_invoice)
+    client = TestClient(app)
+    business_id = sign_in(client)
+    own_invoice(monkeypatch, extraction, "inv-multi", clean_invoice, business_id)
 
-    response = TestClient(app).get("/api/invoices/inv-multi/export/csv")
+    response = client.get("/api/invoices/inv-multi/export/csv")
 
     assert response.status_code == 200
     rows = list(csv.reader(io.StringIO(response.content.decode("utf-8"))))
@@ -181,11 +188,12 @@ def test_csv_export_uses_one_row_per_line_item(monkeypatch, clean_invoice):
     assert rows[1][CSV_COLUMNS.index("invoice_number")] == rows[2][CSV_COLUMNS.index("invoice_number")]
 
 
-def test_blocked_invoice_returns_conflict(monkeypatch, clean_invoice):
+def test_blocked_invoice_returns_conflict(monkeypatch, clean_invoice, sign_in):
     clean_invoice.supplier.name = None
-    monkeypatch.setitem(extraction.invoices, "inv-blocked", clean_invoice)
-
     client = TestClient(app)
+    business_id = sign_in(client)
+    own_invoice(monkeypatch, extraction, "inv-blocked", clean_invoice, business_id)
+
     json_response = client.get("/api/invoices/inv-blocked/export/json")
     csv_response = client.get("/api/invoices/inv-blocked/export/csv")
 
@@ -194,27 +202,29 @@ def test_blocked_invoice_returns_conflict(monkeypatch, clean_invoice):
     assert "not export ready" in json_response.json()["detail"]
 
 
-def test_missing_invoice_exports_return_404():
+def test_missing_invoice_exports_return_404(sign_in):
     client = TestClient(app)
+    sign_in(client)
 
     assert client.get("/api/invoices/does-not-exist/export/json").status_code == 404
     assert client.get("/api/invoices/does-not-exist/export/csv").status_code == 404
 
 
-def test_successful_exports_record_audit_events(monkeypatch, tmp_path):
+def test_successful_exports_record_audit_events(monkeypatch, tmp_path, sign_in):
     monkeypatch.setattr(settings, "storage_root", str(tmp_path))
+    client = TestClient(app)
+    business_id = sign_in(client)
     audit = AuditService()
-    pipeline, invoice_id = pipeline_with(audit)
+    pipeline, invoice_id = pipeline_with(audit, business_id=business_id)
     monkeypatch.setattr(invoices_routes, "extraction", pipeline)
     monkeypatch.setattr(invoices_routes, "audit", audit)
 
-    client = TestClient(app)
     assert client.get(f"/api/invoices/{invoice_id}/export/json").status_code == 200
     assert client.get(f"/api/invoices/{invoice_id}/export/csv").status_code == 200
 
     export_events = [
         event
-        for event in audit.list_for_invoice(invoice_id)
+        for event in audit.list_for_invoice(invoice_id, business_id)
         if event.event_type.startswith("export_")
     ]
     assert [event.event_type for event in export_events] == [
@@ -228,21 +238,23 @@ def test_successful_exports_record_audit_events(monkeypatch, tmp_path):
     assert "content" not in export_events[0].metadata
 
 
-def test_blocked_export_records_no_success_event(monkeypatch, tmp_path):
+def test_blocked_export_records_no_success_event(monkeypatch, tmp_path, sign_in):
     monkeypatch.setattr(settings, "storage_root", str(tmp_path))
+    client = TestClient(app)
+    business_id = sign_in(client)
     audit = AuditService()
     broken = invoice()
     broken.supplier.name = None
-    pipeline, invoice_id = pipeline_with(audit, extracted=broken)
+    pipeline, invoice_id = pipeline_with(audit, extracted=broken, business_id=business_id)
     monkeypatch.setattr(invoices_routes, "extraction", pipeline)
     monkeypatch.setattr(invoices_routes, "audit", audit)
 
-    response = TestClient(app).get(f"/api/invoices/{invoice_id}/export/json")
+    response = client.get(f"/api/invoices/{invoice_id}/export/json")
 
     assert response.status_code == 409
     export_events = [
         event
-        for event in audit.list_for_invoice(invoice_id)
+        for event in audit.list_for_invoice(invoice_id, business_id)
         if event.event_type.startswith("export_")
     ]
     assert export_events == []

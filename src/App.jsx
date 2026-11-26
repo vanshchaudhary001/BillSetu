@@ -4,26 +4,30 @@ import {
   Building2, CalendarDays, Check, CheckCheck, CheckCircle2, ChevronDown, CircleAlert,
   CircleHelp, ClipboardList, CloudUpload, Download, FileCheck2, FileDown, FileSpreadsheet,
   FileText, Gauge, Globe2, HardDrive, HelpCircle, History, Home, Languages, LayoutDashboard,
-  ListFilter, LockKeyhole, MoreHorizontal, Plus, ReceiptText, RotateCcw, Search, Settings2,
+  ListFilter, Lock, LockKeyhole, LogOut, Mail, MoreHorizontal, Plus, ReceiptText, Search, Settings2,
   ShieldCheck, Sparkles, Trash2, Upload, X, Zap
 } from 'lucide-react';
 import { deriveInvoiceStatus, getBucket, getReadiness, invoiceInPeriod, runGSTChecks, STATE_CODES, gstinChecksumValid, suggestGSTINRepairs } from './lib/gst.js';
 import { demoInjectionInvoice, demoInvoice, normalizeDate, parseRegister, scanDocument, validateFile } from './lib/intake.js';
-import { deleteLocalDocument, loadLocalDocument, readLocalState, saveLocalDocument, writeLocalState, clearLocalWorkspace } from './lib/storage.js';
+import { deleteLocalDocument, loadLocalDocument, migrateLegacyRecords, readBusinessState, readLocalState, saveLocalDocument, writeBusinessState, writeLocalState } from './lib/storage.js';
 import { downloadBlob, makeCAWorkbook, makeGstr1Draft } from './lib/exports.js';
-import { ApiError, exportInvoiceCsv, exportInvoiceJson, extractDocument, getDocumentAudit, getDocumentContent, getInvoiceAudit, getInvoiceGstr1, healthCheck, uploadDocument, validateInvoice } from './lib/api.js';
-import { mapBackendGstr1ToFrontendInvoice, mapBackendValidationToFrontendInvoice, mapCanonicalInvoiceToFrontendInvoice, markBackendGstr1Unavailable } from './lib/mappers.js';
+import { ApiError, exportInvoiceCsv, exportInvoiceJson, extractDocument, getDocumentAudit, getDocumentContent, getInvoiceAudit, getInvoiceGstr1, healthCheck, listBusinesses, listDocuments, listInvoices, uploadDocument, validateInvoice } from './lib/api.js';
+import { mapBackendGstr1ToFrontendInvoice, mapBackendValidationToFrontendInvoice, mapCanonicalInvoiceToFrontendInvoice, markBackendGstr1Unavailable, mapServerInvoiceSummaryToFrontendInvoice, SERVER_VALIDATION_PENDING } from './lib/mappers.js';
+import { useAuth, validateAuthForm } from './lib/auth.js';
 import './styles.css';
 import './app.css';
 
-const PROFILE_SEED = { name: 'Sharma Electricals', gstin: '09ABCDE1234F1ZY', state: 'Uttar Pradesh', address: '14 Market Road, Lucknow, Uttar Pradesh 226001', scheme: 'regular', turnover: 'under-5cr', hsnDigits: 4, filing: 'Monthly', period: 'October 2026' };
+const EMPTY_PROFILE = { name: '', gstin: '', state: '', address: '', scheme: 'regular', turnover: 'under-5cr', hsnDigits: 4, filing: 'Monthly', period: 'November 2026' };
+const DEMO_PROFILE = { name: 'Sharma Electricals', gstin: '09ABCDE1234F1ZY', state: 'Uttar Pradesh', address: '14 Market Road, Lucknow, Uttar Pradesh 226001', scheme: 'regular', turnover: 'under-5cr', hsnDigits: 4, filing: 'Monthly', period: 'October 2026' };
+const DEMO_PREFERENCES = { language: 'en' };
+const DEMO_HISTORY = [{ id: 'seed-1', at: '2026-10-20T10:15:00.000Z', invoice: 'INV/26-27/108', action: 'Demo record confirmed', details: 'Synthetic sample data loaded into this temporary demo workspace.' }];
 const makeInvoice = fields => ({ id: crypto.randomUUID(), direction: 'sale', status: 'review', issues: [], confidence: 82, kind: 'Tax invoice', source: 'Manual entry', items: [], ...fields });
 const DEMO_INVOICES = [
-  makeInvoice({ id: 'inv-041', no: 'SH/26-27/0041', party: 'Aarav Electricals', gstin: '09XYZAB5678KIZN', date: '2026-10-20', isoDate: '2026-10-20', amount: 45000, tax: 5400, cgst: 2700, sgst: 2700, igst: 0, totalWritten: 49800, bucket: 'B2B', status: 'blocked', issues: ['GSTIN checksum needs verification', 'Invoice total differs by ₹600', '12% rate advisory'], source: 'Synthetic demo invoice', confidence: 72, color: 'mint', kind: 'Handwritten tax invoice', supplier: PROFILE_SEED.name, supplierGstin: PROFILE_SEED.gstin, supplierStateCode: '09', supplierAddress: PROFILE_SEED.address, pos: 'Uttar Pradesh', posStateCode: '09', hsn: '8536', rawText: 'Synthetic record for the demo. No real taxpayer data.', items: [{ description: 'Electrical fittings', quantity: 1, rate: 45000, discount: 0, hsn: '8536' }], totalWritten: 49800 }),
-  makeInvoice({ id: 'inv-038', no: 'INV/26-27/108', party: 'Mehta Traders', gstin: '27AAKFM2916L1ZY', date: '2026-10-19', isoDate: '2026-10-19', amount: 128400, tax: 23112, cgst: 0, sgst: 0, igst: 23112, totalWritten: 151512, bucket: 'B2B', status: 'ready', confirmed: true, issues: [], source: 'Synthetic demo invoice', confidence: 98, color: 'blue', supplier: PROFILE_SEED.name, supplierGstin: PROFILE_SEED.gstin, pos: 'Maharashtra', posStateCode: '27', hsn: '8536', items: [{ description: 'Electrical parts', quantity: 1, rate: 128400, discount: 0, hsn: '8536' }] }),
-  makeInvoice({ id: 'inv-036', no: 'ST/1198', party: 'Walk-in customer', gstin: 'Unregistered', date: '2026-10-18', isoDate: '2026-10-18', amount: 62000, tax: 11160, cgst: 5580, sgst: 5580, igst: 0, totalWritten: 73160, bucket: 'B2CS', status: 'review', issues: ['Confirm buyer address for this high-value retail bill'], source: 'Synthetic demo register', confidence: 88, color: 'amber', supplier: PROFILE_SEED.name, supplierGstin: PROFILE_SEED.gstin, pos: 'Uttar Pradesh', posStateCode: '09', hsn: '8536', buyerAddress: '', items: [{ description: 'Lighting supplies', quantity: 1, rate: 62000, discount: 0, hsn: '8536' }] }),
-  makeInvoice({ id: 'inv-032', no: 'SE/26-27/032', party: 'Northstar Components', gstin: '07AABCN8542F1ZH', date: '2026-10-17', isoDate: '2026-10-17', amount: 216000, tax: 38880, cgst: 0, sgst: 0, igst: 38880, totalWritten: 254880, bucket: 'B2B', status: 'ready', confirmed: true, issues: [], source: 'Synthetic demo invoice', confidence: 96, color: 'lavender', supplier: PROFILE_SEED.name, supplierGstin: PROFILE_SEED.gstin, pos: 'Delhi', posStateCode: '07', hsn: '8536', items: [{ description: 'Switchgear', quantity: 1, rate: 216000, discount: 0, hsn: '8536' }] }),
-  makeInvoice({ id: 'inv-029', no: 'SH/26-27/0038', party: 'Walk-in customer', gstin: 'Unregistered', date: '2026-10-16', isoDate: '2026-10-16', amount: 145000, tax: 26100, cgst: 0, sgst: 0, igst: 26100, totalWritten: 171100, bucket: 'B2CL', status: 'ready', confirmed: true, issues: [], source: 'Synthetic demo invoice', confidence: 91, color: 'coral', supplier: PROFILE_SEED.name, supplierGstin: PROFILE_SEED.gstin, pos: 'Maharashtra', posStateCode: '27', buyerAddress: 'Mumbai, Maharashtra', hsn: '8536', items: [{ description: 'Electrical goods', quantity: 1, rate: 145000, discount: 0, hsn: '8536' }] }),
+  makeInvoice({ id: 'inv-041', no: 'SH/26-27/0041', party: 'Aarav Electricals', gstin: '09XYZAB5678KIZN', date: '2026-10-20', isoDate: '2026-10-20', amount: 45000, tax: 5400, cgst: 2700, sgst: 2700, igst: 0, totalWritten: 49800, bucket: 'B2B', status: 'blocked', issues: ['GSTIN checksum needs verification', 'Invoice total differs by ₹600', '12% rate advisory'], source: 'Synthetic demo invoice', confidence: 72, color: 'mint', kind: 'Handwritten tax invoice', supplier: DEMO_PROFILE.name, supplierGstin: DEMO_PROFILE.gstin, supplierStateCode: '09', supplierAddress: DEMO_PROFILE.address, pos: 'Uttar Pradesh', posStateCode: '09', hsn: '8536', rawText: 'Synthetic record for the demo. No real taxpayer data.', items: [{ description: 'Electrical fittings', quantity: 1, rate: 45000, discount: 0, hsn: '8536' }], totalWritten: 49800 }),
+  makeInvoice({ id: 'inv-038', no: 'INV/26-27/108', party: 'Mehta Traders', gstin: '27AAKFM2916L1ZY', date: '2026-10-19', isoDate: '2026-10-19', amount: 128400, tax: 23112, cgst: 0, sgst: 0, igst: 23112, totalWritten: 151512, bucket: 'B2B', status: 'ready', confirmed: true, issues: [], source: 'Synthetic demo invoice', confidence: 98, color: 'blue', supplier: DEMO_PROFILE.name, supplierGstin: DEMO_PROFILE.gstin, pos: 'Maharashtra', posStateCode: '27', hsn: '8536', items: [{ description: 'Electrical parts', quantity: 1, rate: 128400, discount: 0, hsn: '8536' }] }),
+  makeInvoice({ id: 'inv-036', no: 'ST/1198', party: 'Walk-in customer', gstin: 'Unregistered', date: '2026-10-18', isoDate: '2026-10-18', amount: 62000, tax: 11160, cgst: 5580, sgst: 5580, igst: 0, totalWritten: 73160, bucket: 'B2CS', status: 'review', issues: ['Confirm buyer address for this high-value retail bill'], source: 'Synthetic demo register', confidence: 88, color: 'amber', supplier: DEMO_PROFILE.name, supplierGstin: DEMO_PROFILE.gstin, pos: 'Uttar Pradesh', posStateCode: '09', hsn: '8536', buyerAddress: '', items: [{ description: 'Lighting supplies', quantity: 1, rate: 62000, discount: 0, hsn: '8536' }] }),
+  makeInvoice({ id: 'inv-032', no: 'SE/26-27/032', party: 'Northstar Components', gstin: '07AABCN8542F1ZH', date: '2026-10-17', isoDate: '2026-10-17', amount: 216000, tax: 38880, cgst: 0, sgst: 0, igst: 38880, totalWritten: 254880, bucket: 'B2B', status: 'ready', confirmed: true, issues: [], source: 'Synthetic demo invoice', confidence: 96, color: 'lavender', supplier: DEMO_PROFILE.name, supplierGstin: DEMO_PROFILE.gstin, pos: 'Delhi', posStateCode: '07', hsn: '8536', items: [{ description: 'Switchgear', quantity: 1, rate: 216000, discount: 0, hsn: '8536' }] }),
+  makeInvoice({ id: 'inv-029', no: 'SH/26-27/0038', party: 'Walk-in customer', gstin: 'Unregistered', date: '2026-10-16', isoDate: '2026-10-16', amount: 145000, tax: 26100, cgst: 0, sgst: 0, igst: 26100, totalWritten: 171100, bucket: 'B2CL', status: 'ready', confirmed: true, issues: [], source: 'Synthetic demo invoice', confidence: 91, color: 'coral', supplier: DEMO_PROFILE.name, supplierGstin: DEMO_PROFILE.gstin, pos: 'Maharashtra', posStateCode: '27', buyerAddress: 'Mumbai, Maharashtra', hsn: '8536', items: [{ description: 'Electrical goods', quantity: 1, rate: 145000, discount: 0, hsn: '8536' }] }),
   makeInvoice({ id: 'inv-026', no: 'PUR/26-27/079', party: 'Om Sai Distributors', gstin: '09AAEFO4498P1ZB', date: '2026-10-15', isoDate: '2026-10-15', amount: 38750, tax: 6975, cgst: 3487.5, sgst: 3487.5, igst: 0, totalWritten: 45725, bucket: 'Purchase', status: 'purchase', issues: [], source: 'Synthetic purchase invoice', confidence: 97, color: 'blue', kind: 'Purchase invoice', supplier: 'Om Sai Distributors', supplierGstin: '09AAEFO4498P1ZB', supplierStateCode: '09', pos: 'Uttar Pradesh', posStateCode: '09', direction: 'purchase', items: [{ description: 'Electrical components', quantity: 1, rate: 38750, discount: 0, hsn: '8536' }] }),
 ];
 
@@ -82,35 +86,120 @@ function validateBackendAuditEvents(events) {
   if (!validEvents) throw new Error('The backend returned an unexpected audit response.');
   return events;
 }
-function Avatar({ children = 'RS' }) { return <span className="avatar-v2">{children}</span>; }
+function Avatar({ children = 'B' }) { return <span className="avatar-v2">{children}</span>; }
 
-export default function App() {
-  const [invoices, setInvoices] = useState(() => {
-    const saved = readLocalState('invoices', null);
-    if (!Array.isArray(saved)) return DEMO_INVOICES;
-    return saved.map(item => {
-      const isoDate = normalizeDate(item.isoDate || item.date);
-      const normalized = { ...item, id: item.id || crypto.randomUUID(), no: item.no || 'Invoice to identify', party: item.party || 'Buyer to confirm', gstin: item.gstin || 'Unregistered', date: isoDate || item.date || '', isoDate, direction: item.direction || 'sale', status: item.status || 'review', issues: Array.isArray(item.issues) ? item.issues : [], items: Array.isArray(item.items) ? item.items : [], source: item.source || 'Saved local record', confidence: item.confidence ?? 0, taxHeadsCaptured: item.taxHeadsCaptured ?? [item.cgst, item.sgst, item.igst, item.cess].some(value => Number(value || 0) > 0) };
-      if (normalized.validationAuthority === 'backend' || normalized.extractionSource === 'backend') {
-        if (normalized.backendValidation) {
-          try {
-            return mapBackendValidationToFrontendInvoice(normalized, normalized.backendValidation);
-          } catch (error) {
-            return mapBackendValidationToFrontendInvoice(normalized, null, `Saved backend validation is invalid: ${error.message}`);
-          }
+const SERVER_CACHE_KEY = 'invoices';
+
+function loadSavedInvoices(businessId = '') {
+  // Persisted business records come from the backend; the browser copy is only
+  // a cache of that answer, scoped to one business. Everything under
+  // `localInvoices` was never uploaded and stays a local-only draft.
+  const cached = readBusinessState(SERVER_CACHE_KEY, [], businessId);
+  const local = readLocalState('localInvoices', null);
+  const saved = [
+    ...(Array.isArray(cached) ? cached : []),
+    ...(Array.isArray(local) ? local : []),
+  ].filter(item => item && typeof item === 'object');
+  if (!saved.length) return [];
+  return saved.map(item => {
+    const isoDate = normalizeDate(item.isoDate || item.date);
+    const normalized = { ...item, id: item.id || crypto.randomUUID(), no: item.no || 'Invoice to identify', party: item.party || 'Buyer to confirm', gstin: item.gstin || 'Unregistered', date: isoDate || item.date || '', isoDate, direction: item.direction || 'sale', status: item.status || 'review', issues: Array.isArray(item.issues) ? item.issues : [], items: Array.isArray(item.items) ? item.items : [], source: item.source || 'Saved local record', confidence: item.confidence ?? 0, taxHeadsCaptured: item.taxHeadsCaptured ?? [item.cgst, item.sgst, item.igst, item.cess].some(value => Number(value || 0) > 0) };
+    if (normalized.validationAuthority === 'backend' || normalized.extractionSource === 'backend') {
+      if (normalized.backendValidation) {
+        try {
+          return mapBackendValidationToFrontendInvoice(normalized, normalized.backendValidation);
+        } catch (error) {
+          return mapBackendValidationToFrontendInvoice(normalized, null, `Saved backend validation is invalid: ${error.message}`);
         }
-        return mapBackendValidationToFrontendInvoice(
-          normalized,
-          null,
-          normalized.backendValidationError || 'This saved backend extraction has no validation result. Re-upload it to obtain an authoritative result.',
-        );
       }
-      return makeInvoice(normalized);
-    });
+      return mapBackendValidationToFrontendInvoice(
+        normalized,
+        null,
+        normalized.backendValidationError || 'This saved backend extraction has no validation result. Re-upload it to obtain an authoritative result.',
+      );
+    }
+    return makeInvoice(normalized);
   });
-  const [profile, setProfile] = useState(() => ({ ...PROFILE_SEED, ...readLocalState('profile', {}) }));
-  const [preferences, setPreferences] = useState(() => ({ language: 'en', replay: true, ...readLocalState('preferences', {}) }));
-  const [audit, setAudit] = useState(() => readLocalState('audit', [{ id: 'seed-1', at: '2026-10-20T10:15:00.000Z', invoice: 'INV/26-27/108', action: 'Demo record confirmed', details: 'Synthetic sample data loaded into this browser.' }]));
+}
+
+// Review state belongs to this browser (confirmations, fetched validation and
+// previews); invoice header fields belong to the backend. A refresh takes the
+// header from the server and keeps the local review state for the same invoice.
+const REVIEW_STATE_KEYS = ['backendValidation', 'backendValidationStatus', 'backendValidationError', 'backendValidationStale', 'backendConfidence', 'backendGstr1', 'backendGstr1Status', 'backendGstr1Error', 'findings', 'status', 'issues', 'confirmed', 'escalated', 'lastConfirmedAt', 'confirmedWarnings', 'fileUrl', 'sourceMediaType', 'sourcePreviewStatus', 'sourcePreviewError'];
+
+function mergeServerRecords(current, serverInvoices) {
+  const existing = new Map(current.filter(row => row.backendInvoiceId).map(row => [row.id, row]));
+  const merged = serverInvoices.map(row => {
+    const prior = existing.get(row.id);
+    if (!prior) return row;
+    const carried = {};
+    REVIEW_STATE_KEYS.forEach(key => { if (prior[key] !== undefined) carried[key] = prior[key]; });
+    return { ...row, ...carried };
+  });
+  const localOnly = current.filter(row => !row.backendInvoiceId);
+  return [...merged, ...localOnly];
+}
+
+function BusinessSwitcher({ business, onSwitch, onError }) {
+  const [businesses, setBusinesses] = useState(() => business ? [business] : []);
+  const [loading, setLoading] = useState(false);
+  const [switching, setSwitching] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    setLoading(true);
+    listBusinesses()
+      .then(rows => { if (active) setBusinesses(rows); })
+      .catch(() => {
+        // The current session-derived business remains usable. Switching is
+        // simply unavailable until the membership list can be read again.
+        if (active) setBusinesses(business ? [business] : []);
+      })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [business?.id]);
+
+  const changeBusiness = async event => {
+    const nextId = event.target.value;
+    if (!nextId || nextId === business?.id || switching || !onSwitch) return;
+    setSwitching(true);
+    try {
+      await onSwitch(nextId);
+    } catch {
+      // The controlled value is still the confirmed current business, so a
+      // failed request cannot make the old workspace look like the new one.
+      onError?.('Could not switch businesses. Your current workspace is unchanged.');
+    } finally {
+      setSwitching(false);
+    }
+  };
+
+  return <label className="workspace-switcher-v2">
+    <span className="workspace-avatar"><Building2 size={17}/></span>
+    <span className="workspace-switcher-copy-v2"><b>{business?.name || 'Business workspace'}</b><small>{loading ? 'Loading businesses…' : switching ? 'Switching…' : 'Business workspace'}</small></span>
+    <select aria-label="Switch business" value={business?.id || ''} onChange={changeBusiness} disabled={loading || switching || businesses.length < 2}>
+      {business && !businesses.some(item => item.id === business.id) && <option value={business.id}>{business.name}</option>}
+      {businesses.map(item => <option key={item.id} value={item.id}>{item.name}</option>)}
+    </select>
+    <ChevronDown size={15}/>
+  </label>;
+}
+
+function Workspace({ user, business, onLogout, onSwitchBusiness, demoOnly = false, onExitDemo }) {
+  const businessId = business?.id || '';
+  const [invoices, setInvoices] = useState(() => {
+    if (demoOnly) return DEMO_INVOICES.map(invoice => ({ ...invoice }));
+    migrateLegacyRecords(user?.id || '');
+    return loadSavedInvoices(businessId);
+  });
+  const [profile, setProfile] = useState(() => {
+    if (demoOnly) return { ...DEMO_PROFILE };
+    const saved = readLocalState('profile', null);
+    return saved && typeof saved === 'object' && !Array.isArray(saved) ? { ...EMPTY_PROFILE, ...saved } : { ...EMPTY_PROFILE };
+  });
+  const [preferences, setPreferences] = useState(() => (demoOnly ? { ...DEMO_PREFERENCES } : { language: 'en', ...readLocalState('preferences', {}) }));
+  const [audit, setAudit] = useState(() => (demoOnly ? [...DEMO_HISTORY] : readLocalState('audit', [])));
+  const [demoMode, setDemoMode] = useState(Boolean(demoOnly));
   const [view, setView] = useState('overview');
   const [filter, setFilter] = useState('all');
   const [query, setQuery] = useState('');
@@ -123,10 +212,17 @@ export default function App() {
   const [profileDraft, setProfileDraft] = useState(profile);
   const [ruleQuery, setRuleQuery] = useState('');
   const [backendState, setBackendState] = useState('checking');
+  // 'loading' | 'ready' | 'unavailable'. A failed listing is never treated as
+  // an empty workspace: the cached records stay and the banner explains why.
+  const [serverState, setServerState] = useState(demoOnly ? 'demo' : 'loading');
+  const [serverError, setServerError] = useState('');
+  const [signingOut, setSigningOut] = useState(false);
   const [toastTimer, setToastTimer] = useState(0);
   const fileInput = useRef(null);
   const searchInput = useRef(null);
+  const normalWorkspaceRef = useRef(null);
   const backendGstr1Requests = useRef(new Set());
+  const backendValidationRequests = useRef(new Set());
   const sourcePreviewRequests = useRef(new Set());
   const activeInvoice = invoices.find(invoice => invoice.id === activeId);
   const labels = preferences.language === 'hi' ? HI : EN;
@@ -145,11 +241,16 @@ export default function App() {
   }), [invoices, query, filter, view]);
 
   useEffect(() => {
-    writeLocalState('invoices', invoices.map(({ fileUrl, sourceMediaType, sourcePreviewError, sourcePreviewStatus, ...invoice }) => invoice));
-  }, [invoices]);
-  useEffect(() => { writeLocalState('profile', profile); }, [profile]);
-  useEffect(() => { writeLocalState('preferences', preferences); }, [preferences]);
-  useEffect(() => { writeLocalState('audit', audit.slice(0, 500)); }, [audit]);
+    if (demoMode) return;
+    const persistable = invoices.map(({ fileUrl, sourceMediaType, sourcePreviewError, sourcePreviewStatus, ...invoice }) => invoice);
+    // Two separate stores: the backend owns persisted business records (cached
+    // per business), the browser owns drafts that were never uploaded.
+    writeBusinessState(SERVER_CACHE_KEY, persistable.filter(row => row.backendInvoiceId), businessId);
+    writeLocalState('localInvoices', persistable.filter(row => !row.backendInvoiceId));
+  }, [invoices, demoMode, businessId]);
+  useEffect(() => { if (!demoMode) writeLocalState('profile', profile); }, [profile, demoMode]);
+  useEffect(() => { if (!demoMode) writeLocalState('preferences', preferences); }, [preferences, demoMode]);
+  useEffect(() => { if (!demoMode) writeLocalState('audit', audit.slice(0, 500)); }, [audit, demoMode]);
   useEffect(() => {
     let active = true;
     healthCheck()
@@ -157,6 +258,42 @@ export default function App() {
       .catch(() => { if (active) setBackendState('unavailable'); });
     return () => { active = false; };
   }, []);
+  useEffect(() => {
+    // Authoritative reads for the active business. One listing per record type:
+    // no per-invoice GETs and no document-content fetches at startup; contents
+    // stay on-demand in the preview workflow.
+    if (demoOnly) { setServerState('demo'); return undefined; }
+    // The business context resolves just after a sign-in; until then the
+    // workspace waits instead of claiming its records are unavailable.
+    if (!businessId) { setServerState('loading'); return undefined; }
+    let active = true;
+    setServerState('loading');
+    setServerError('');
+    Promise.all([listInvoices(), listDocuments()])
+      .then(([invoiceRows, documentRows]) => {
+        if (!active) return;
+        const documentById = new Map();
+        (Array.isArray(documentRows) ? documentRows : []).forEach(document => {
+          if (document?.document_id) documentById.set(document.document_id, document);
+        });
+        const loadedAt = new Date().toISOString();
+        const serverInvoices = invoiceRows.map(row => mapServerInvoiceSummaryToFrontendInvoice(row, {
+          businessId,
+          loadedAt,
+          document: documentById.get(row.document_id) || null,
+        }));
+        setInvoices(current => mergeServerRecords(current, serverInvoices));
+        setServerState('ready');
+      })
+      .catch(error => {
+        if (!active) return;
+        // A failed listing is not an empty workspace: cached records stay and
+        // the workspace states plainly that the backend did not answer.
+        setServerState('unavailable');
+        setServerError(error?.message || 'The BillSetu backend could not load your business records.');
+      });
+    return () => { active = false; };
+  }, [demoOnly, businessId]);
   useEffect(() => {
     const pending = invoices.filter(item => item.validationAuthority === 'backend'
       && item.backendValidation
@@ -187,6 +324,28 @@ export default function App() {
       }
     });
   }, [invoices]);
+  useEffect(() => {
+    // A listed invoice carries header facts only. Opening it asks the backend
+    // for its authoritative validation once, instead of pre-fetching per row.
+    if (demoMode || !activeId) return;
+    const invoice = invoices.find(item => item.id === activeId);
+    if (!invoice?.backendInvoiceId || invoice.backendValidation) return;
+    if (invoice.backendValidationError && invoice.backendValidationError !== SERVER_VALIDATION_PENDING) return;
+    if (backendValidationRequests.current.has(invoice.id)) return;
+    backendValidationRequests.current.add(invoice.id);
+    validateInvoice(invoice.backendInvoiceId)
+      .then(validation => setInvoices(current => current.map(row => row.id === invoice.id
+        ? mapBackendValidationToFrontendInvoice(row, validation)
+        : row)))
+      .catch(error => {
+        const detail = error instanceof ApiError && typeof error.detail === 'string' && error.detail ? ` ${error.detail}` : '';
+        const message = `${error.message || 'The backend validation request failed.'}${detail}`;
+        setInvoices(current => current.map(row => row.id === invoice.id
+          ? mapBackendValidationToFrontendInvoice(row, null, message)
+          : row));
+      })
+      .finally(() => backendValidationRequests.current.delete(invoice.id));
+  }, [demoMode, activeId, invoices]);
   useEffect(() => {
     setInvoices(current => current.map(item => {
       if (item.direction === 'purchase' || item.validationAuthority === 'backend' || invoiceInPeriod(item, profile.period) || (!item.confirmed && item.status !== 'ready')) return item;
@@ -250,6 +409,17 @@ export default function App() {
     if (toastTimer) window.clearTimeout(toastTimer);
     setToastTimer(window.setTimeout(() => setNotice(''), 4200));
   };
+  const signOut = async () => {
+    if (!onLogout || signingOut) return;
+    setSigningOut(true);
+    try {
+      // The backend revokes the server session; the gate then clears this workspace.
+      await onLogout();
+    } catch (error) {
+      setSigningOut(false);
+      notify(error?.message || 'Could not sign out because the BillSetu backend is unavailable. You are still signed in.', 'error');
+    }
+  };
   const recordAction = (invoice, action, details) => setAudit(previous => [{ id: crypto.randomUUID(), at: new Date().toISOString(), invoice: invoice?.no || 'Workspace', action, details }, ...previous].slice(0, 500));
   const updateInvoice = (id, patch) => setInvoices(previous => previous.map(item => {
     if (item.id !== id) return item;
@@ -289,65 +459,70 @@ export default function App() {
         setScanProgress({ name: file.name, percent: 0, phase: 'Checking file' });
         let result;
         let backendExtracted = false;
-        try {
-          setBackendState('checking');
-          setScanProgress({ name: file.name, percent: 10, phase: 'Uploading document to BillSetu' });
-          const uploaded = await uploadDocument(file);
-          if (!uploaded?.document_id) throw new ApiError('The backend upload did not return a document ID.', 422);
-          if (uploaded.status === 'quarantined') throw new ApiError('This document requires review and was quarantined by the backend.', 409);
-          setScanProgress({ name: file.name, percent: 45, phase: 'Extracting invoice on BillSetu' });
-          const extracted = await extractDocument(uploaded.document_id);
-          if (!extracted?.invoice || typeof extracted.invoice !== 'object' || typeof extracted.invoice_id !== 'string' || !extracted.invoice_id.trim()) {
-            throw new ApiError('The backend returned an unexpected extraction response.', 502);
-          }
-          const frontendInvoice = mapCanonicalInvoiceToFrontendInvoice(extracted.invoice, {
-            documentId: uploaded.document_id,
-            invoiceId: extracted.invoice_id,
-            fileName: file.name,
-          });
-          setScanProgress({ name: file.name, percent: 75, phase: 'Validating invoice on BillSetu' });
+        if (demoMode) {
+          setScanProgress({ name: file.name, percent: 0, phase: 'Reading bill in temporary demo mode' });
+          result = await scanDocument(file, percent => setScanProgress({ name: file.name, percent, phase: 'Reading bill in temporary demo mode' }));
+        } else {
           try {
-            const validation = await validateInvoice(extracted.invoice_id);
-            result = [mapBackendValidationToFrontendInvoice(frontendInvoice, validation)];
-            setBackendState('connected');
-          } catch (error) {
-            const message = error.message || 'The backend validation request failed.';
-            result = [mapBackendValidationToFrontendInvoice(frontendInvoice, null, message)];
-            setScanError(`${file.name}: validation failed. The extracted invoice was saved for review but cannot be confirmed. ${message}`);
-            setBackendState(error instanceof ApiError && error.status === 0 ? 'unavailable' : 'connected');
-          }
-          backendExtracted = true;
-        } catch (error) {
-          if (error instanceof ApiError && error.status === 409) {
-            setBackendState('connected');
-            let key = '';
-            try { key = crypto.randomUUID(); await saveLocalDocument(key, file); } catch { key = ''; }
-            const blobUrl = backendExtracted ? '' : URL.createObjectURL(file);
-            added.push({
-              id: `quarantine-${crypto.randomUUID()}`,
-              no: 'QUARANTINE', party: 'Buyer to confirm', gstin: 'Unregistered',
-              date: '', isoDate: '', amount: 0, tax: 0, cgst: 0, sgst: 0, igst: 0, cess: 0,
-              taxHeadsCaptured: false, totalWritten: 0, bucket: 'Review',
-              status: 'blocked', issues: ['Backend quarantine - document requires manual review'],
-              source: file.name, confidence: 0, color: 'coral',
-              kind: 'Quarantined document', supplier: profile.name,
-              supplierGstin: profile.gstin, supplierStateCode: profile.gstin.slice(0, 2),
-              supplierAddress: profile.address, pos: '', posStateCode: '',
-              hsn: '', direction: 'sale', rawText: '', items: [],
-              fileKey: key, fileUrl: blobUrl, sourcePersistenceFailed: !key,
-              extractionSource: 'backend',
-              validationAuthority: 'backend',
-              backendQuarantined: true,
-              backendValidationError: 'The backend quarantined this document before extraction.',
+            setBackendState('checking');
+            setScanProgress({ name: file.name, percent: 10, phase: 'Uploading document to BillSetu' });
+            const uploaded = await uploadDocument(file);
+            if (!uploaded?.document_id) throw new ApiError('The backend upload did not return a document ID.', 422);
+            if (uploaded.status === 'quarantined') throw new ApiError('This document requires review and was quarantined by the backend.', 409);
+            setScanProgress({ name: file.name, percent: 45, phase: 'Extracting invoice on BillSetu' });
+            const extracted = await extractDocument(uploaded.document_id);
+            if (!extracted?.invoice || typeof extracted.invoice !== 'object' || typeof extracted.invoice_id !== 'string' || !extracted.invoice_id.trim()) {
+              throw new ApiError('The backend returned an unexpected extraction response.', 502);
+            }
+            const frontendInvoice = mapCanonicalInvoiceToFrontendInvoice(extracted.invoice, {
+              documentId: uploaded.document_id,
+              invoiceId: extracted.invoice_id,
+              fileName: file.name,
             });
-            setScanError(`${file.name}: document requires review and was quarantined by the backend.`);
-            continue;
+            setScanProgress({ name: file.name, percent: 75, phase: 'Validating invoice on BillSetu' });
+            try {
+              const validation = await validateInvoice(extracted.invoice_id);
+              result = [mapBackendValidationToFrontendInvoice(frontendInvoice, validation)];
+              setBackendState('connected');
+            } catch (error) {
+              const message = error.message || 'The backend validation request failed.';
+              result = [mapBackendValidationToFrontendInvoice(frontendInvoice, null, message)];
+              setScanError(`${file.name}: validation failed. The extracted invoice was saved for review but cannot be confirmed. ${message}`);
+              setBackendState(error instanceof ApiError && error.status === 0 ? 'unavailable' : 'connected');
+            }
+            backendExtracted = true;
+          } catch (error) {
+            if (error instanceof ApiError && error.status === 409) {
+              setBackendState('connected');
+              let key = '';
+              try { key = crypto.randomUUID(); await saveLocalDocument(key, file); } catch { key = ''; }
+              const blobUrl = backendExtracted ? '' : URL.createObjectURL(file);
+              added.push({
+                id: `quarantine-${crypto.randomUUID()}`,
+                no: 'QUARANTINE', party: 'Buyer to confirm', gstin: 'Unregistered',
+                date: '', isoDate: '', amount: 0, tax: 0, cgst: 0, sgst: 0, igst: 0, cess: 0,
+                taxHeadsCaptured: false, totalWritten: 0, bucket: 'Review',
+                status: 'blocked', issues: ['Backend quarantine - document requires manual review'],
+                source: file.name, confidence: 0, color: 'coral',
+                kind: 'Quarantined document', supplier: profile.name,
+                supplierGstin: profile.gstin, supplierStateCode: profile.gstin.slice(0, 2),
+                supplierAddress: profile.address, pos: '', posStateCode: '',
+                hsn: '', direction: 'sale', rawText: '', items: [],
+                fileKey: key, fileUrl: blobUrl, sourcePersistenceFailed: !key,
+                extractionSource: 'backend',
+                validationAuthority: 'backend',
+                backendQuarantined: true,
+                backendValidationError: 'The backend quarantined this document before extraction.',
+              });
+              setScanError(`${file.name}: document requires review and was quarantined by the backend.`);
+              continue;
+            }
+            setBackendState(error instanceof ApiError && error.status === 0 ? 'unavailable' : 'connected');
+            setScanProgress({ name: file.name, percent: 0, phase: 'Backend unavailable - reading bill on this device' });
+            result = await scanDocument(file, percent => setScanProgress({ name: file.name, percent, phase: 'Reading bill on this device' }));
+            const message = error instanceof ApiError ? error.message : 'The backend request failed.';
+            setScanError(`${file.name}: ${message} Offline fallback is processing the document.`);
           }
-          setBackendState(error instanceof ApiError && error.status === 0 ? 'unavailable' : 'connected');
-          setScanProgress({ name: file.name, percent: 0, phase: 'Backend unavailable - reading bill on this device' });
-          result = await scanDocument(file, percent => setScanProgress({ name: file.name, percent, phase: 'Reading bill on this device' }));
-          const message = error instanceof ApiError ? error.message : 'The backend request failed.';
-          setScanError(`${file.name}: ${message} Offline fallback is processing the document.`);
         }
         if (Array.isArray(result) && result[0]?.kind === 'Sales register row') {
           const rows = result.map(row => {
@@ -362,8 +537,10 @@ export default function App() {
           continue;
         }
         let key = '';
-        try { key = crypto.randomUUID(); await saveLocalDocument(key, file); }
-        catch { key = ''; /* keep extracted fields even when the browser cannot persist the source */ }
+        if (!demoMode) {
+          try { key = crypto.randomUUID(); await saveLocalDocument(key, file); }
+          catch { key = ''; /* keep extracted fields even when the browser cannot persist the source */ }
+        }
         const blobUrl = URL.createObjectURL(file);
         const record = {
           ...result[0],
@@ -479,24 +656,82 @@ export default function App() {
     notify('Suggestion applied. Review the updated value before confirming.');
   };
 
+  const openDemoWorkspace = (extraInvoices = [], selectedId = '') => {
+    if (!demoMode) {
+      normalWorkspaceRef.current = {
+        invoices, profile, preferences, audit, view, filter, query, activeId, profileDraft, profileEditing,
+      };
+    }
+    const demoProfile = { ...DEMO_PROFILE };
+    const demoExtras = extraInvoices.map(invoice => ({
+      ...invoice,
+      supplier: demoProfile.name,
+      supplierGstin: demoProfile.gstin,
+      supplierStateCode: demoProfile.gstin.slice(0, 2),
+      supplierAddress: demoProfile.address,
+    }));
+    setDemoMode(true);
+    setInvoices([...demoExtras, ...DEMO_INVOICES]);
+    setProfile(demoProfile);
+    setProfileDraft(demoProfile);
+    setProfileEditing(false);
+    setPreferences({ ...DEMO_PREFERENCES });
+    setAudit([
+      ...demoExtras.map(invoice => ({
+        id: crypto.randomUUID(),
+        at: new Date().toISOString(),
+        invoice: invoice.no,
+        action: invoice.demo ? 'Started offline replay' : 'Ran document safety replay',
+        details: invoice.demo
+          ? 'Synthetic invoice with GSTIN typo, total mismatch and rate advisory.'
+          : 'Synthetic instruction-like text is treated as untrusted bill content.',
+      })),
+      ...DEMO_HISTORY,
+    ]);
+    setView(selectedId ? 'invoices' : 'overview');
+    setFilter('all');
+    setQuery('');
+    setActiveId(selectedId);
+    setManualOpen(false);
+    setScanError('');
+  };
   const runDemo = () => {
-    if (!preferences.replay) { notify('Turn on Guided demo replay in Settings to load synthetic demo scenarios.', 'error'); return; }
-    const replay = { ...demoInvoice(), supplier: profile.name, supplierGstin: profile.gstin, supplierStateCode: profile.gstin.slice(0,2), supplierAddress: profile.address };
-    const existing = invoices.find(item => item.no === replay.no && item.source === replay.source);
-    if (existing) { setActiveId(existing.id); setView('invoices'); notify('Demo replay is open. Try the GSTIN fix and total check.'); return; }
-    setInvoices(previous => [replay, ...previous]);
-    setActiveId(replay.id); setView('invoices');
-    recordAction(replay, 'Started offline replay', 'Synthetic invoice with GSTIN typo, ₹600 total mismatch and rate advisory.');
-    notify('Synthetic replay ready. No real business data was used.');
+    const replay = demoInvoice();
+    openDemoWorkspace([replay], replay.id);
+    notify('Temporary demo workspace opened. Changes will not be saved to your normal workspace.');
   };
   const runInjectionDemo = () => {
-    if (!preferences.replay) { notify('Turn on Guided demo replay in Settings to test the safety check.', 'error'); return; }
-    const replay = { ...demoInjectionInvoice(), supplier: profile.name, supplierGstin: profile.gstin, supplierStateCode: profile.gstin.slice(0,2), supplierAddress: profile.address };
-    const existing = invoices.find(item => item.no === replay.no && item.source === replay.source);
-    if (existing) { setActiveId(existing.id); setView('invoices'); notify('Security replay opened. R12 should quarantine its embedded instruction.'); return; }
-    setInvoices(previous => [replay, ...previous]); setActiveId(replay.id); setView('invoices');
-    recordAction(replay, 'Ran document safety replay', 'Synthetic instruction-like text was treated as untrusted bill content and quarantined.');
-    notify('Safety replay ready. The embedded text cannot change totals or approve a bill.');
+    const replay = demoInjectionInvoice();
+    openDemoWorkspace([replay], replay.id);
+    notify('Safety replay opened in temporary demo mode. No document is uploaded or saved.');
+  };
+  const exitDemo = () => {
+    if (!demoMode) return;
+    invoices.forEach(item => { if (item.fileUrl) URL.revokeObjectURL(item.fileUrl); });
+    if (demoOnly) {
+      // Entered from the sign-in screen: leave the demo without restoring or
+      // writing any saved workspace data, and return to the auth screen.
+      normalWorkspaceRef.current = null;
+      onExitDemo?.();
+      return;
+    }
+    const normal = normalWorkspaceRef.current;
+    if (normal) {
+      setInvoices(normal.invoices);
+      setProfile(normal.profile);
+      setPreferences(normal.preferences);
+      setAudit(normal.audit);
+      setView(normal.view);
+      setFilter(normal.filter);
+      setQuery(normal.query);
+      setActiveId(normal.activeId);
+      setProfileDraft(normal.profileDraft);
+      setProfileEditing(normal.profileEditing);
+    }
+    setManualOpen(false);
+    normalWorkspaceRef.current = null;
+    setDemoMode(false);
+    notify('Demo ended. Your previous workspace has been restored.');
   };
   const downloadBackendExports = async (records, format) => {
     let downloaded = 0;
@@ -593,14 +828,6 @@ export default function App() {
     recordAction(null, 'Updated business profile', `GSTIN state code ${gstin.slice(0,2)} · ${next.scheme} scheme.`);
     notify('Business profile saved locally.');
   };
-  const resetWorkspace = async () => {
-    if (!window.confirm('Reset this browser workspace to the synthetic sample records? Uploaded records and business settings will be removed.')) return;
-    invoices.forEach(item => { if (item.fileUrl) URL.revokeObjectURL(item.fileUrl); });
-    await Promise.allSettled(invoices.map(item => deleteLocalDocument(item.fileKey)));
-    clearLocalWorkspace();
-    setInvoices(DEMO_INVOICES); setProfile(PROFILE_SEED); setProfileDraft(PROFILE_SEED); setAudit([]); setView('overview'); setActiveId('');
-    notify('Synthetic sample workspace restored.');
-  };
   const copyCAInvite = async () => {
     const pending = invoices.filter(item => item.status !== 'ready' && item.direction !== 'purchase').length;
     const inviteText = `BillSetu CA review for ${profile.name}: ${pending} sales record(s) need attention. Review the attached CA pack. This is a local prototype workspace.`;
@@ -612,7 +839,7 @@ export default function App() {
   return <div className="app-v2">
     <aside className="side-v2">
       <button className="brand-v2" onClick={() => goTo('overview')} aria-label="BillSetu overview"><span className="brand-mark-v2"><ReceiptText size={19}/></span><span><b>billsetu<span>.</span></b><small>GST, made simpler</small></span></button>
-      <button className="workspace-chip" onClick={()=>goTo('settings')}><div className="workspace-avatar">{profile.name.slice(0,1).toUpperCase()}</div><span><b>{profile.name}</b><small>{profile.gstin}</small></span><ChevronDown size={15}/></button>
+       {demoMode ? <button className="workspace-chip" onClick={()=>goTo('settings')}><div className="workspace-avatar">{(profile.name || 'B').slice(0,1).toUpperCase()}</div><span><b>{profile.name || 'New workspace'}</b><small>{profile.gstin || 'Add business details'}</small></span><ChevronDown size={15}/></button> : <BusinessSwitcher business={business} onSwitch={onSwitchBusiness} onError={message=>notify(message, 'error')}/>}
       <div className="side-label">WORKSPACE</div>
       <nav className="nav-v2" aria-label="Main navigation">
         {[["overview",LayoutDashboard],["invoices",ReceiptText],["attention",CircleAlert],["reports",FileSpreadsheet]].map(([key,Icon])=><button key={key} className={view===key?'selected':''} onClick={()=>goTo(key)}><Icon size={18}/><span>{labels[key]}</span>{key==='invoices'&&<i>{invoices.length}</i>}{key==='attention'&&<i className="nav-alert-count">{issueCount}</i>}</button>)}
@@ -620,14 +847,19 @@ export default function App() {
       <div className="side-label tools-label-v2">TOOLS</div>
       <nav className="nav-v2">{[["rules",BookOpenCheck],["ca",Globe2],["help",CircleHelp]].map(([key,Icon])=><button key={key} className={view===key?'selected':''} onClick={()=>goTo(key)}><Icon size={18}/><span>{labels[key]}</span></button>)}</nav>
       <div className="side-grow"/>
-      <div className="privacy-card-v2"><LockKeyhole size={16}/><div><b>Saved on this device</b><small>Your records stay in this browser in Offline Replay mode.</small></div><span className="local-dot"/></div>
-      <button className="profile-v2" onClick={()=>goTo('settings')}><Avatar/> <span><b>Business owner</b><small>Workspace settings</small></span><MoreHorizontal size={18}/></button>
+      <div className="privacy-card-v2"><LockKeyhole size={16}/><div><b>{demoMode?'Temporary demo':'Saved on this device'}</b><small>{demoMode?'Demo changes stay in this session.':'Your records stay in this browser.'}</small></div><span className="local-dot"/></div>
+      <div className="profile-row-v2">
+        <button className="profile-v2" onClick={()=>goTo('settings')}><Avatar/> <span><b>{user?.email || 'Local workspace'}</b><small>{user ? (business?.name || 'Signed in') : 'Workspace settings'}</small></span><MoreHorizontal size={18}/></button>
+        {onLogout&&<button className="icon-v2 signout-v2" title="Sign out" aria-label="Sign out" onClick={signOut} disabled={signingOut}><LogOut size={16}/></button>}
+      </div>
     </aside>
 
     <main className="main-v2">
-      <header className="top-v2"><div className="breadcrumbs"><span>{profile.name}</span><b>/</b><strong>{labels[view] || labels.overview}</strong></div><div className="top-controls"><label className="search-v2"><Search size={17}/><input ref={searchInput} value={query} placeholder={preferences.language==='hi'?'बिल खोजें…':'Search bills or customers'} onChange={event=>{setQuery(event.target.value);if(event.target.value) setView('invoices');}}/><kbd>Ctrl K</kbd></label><button className="icon-v2" title="Open records needing review" onClick={()=>goTo('attention')}><Bell size={18}/>{issueCount>0&&<i/>}</button><button className="language-v2" onClick={()=>setPreferences(prev=>({...prev,language:prev.language==='en'?'hi':'en'}))}><Languages size={16}/>{preferences.language==='en'?'हिंदी':'EN'}</button><button className="user-chip" onClick={()=>goTo('settings')}><Avatar/><span>{profile.name.split(' ')[0]}</span><ChevronDown size={14}/></button></div></header>
+      <header className="top-v2"><div className="breadcrumbs"><span>{profile.name || 'New workspace'}</span><b>/</b><strong>{labels[view] || labels.overview}</strong></div><div className="top-controls"><label className="search-v2"><Search size={17}/><input ref={searchInput} value={query} placeholder={preferences.language==='hi'?'बिल खोजें…':'Search bills or customers'} onChange={event=>{setQuery(event.target.value);if(event.target.value) setView('invoices');}}/><kbd>Ctrl K</kbd></label><button className="icon-v2" title="Open records needing review" onClick={()=>goTo('attention')}><Bell size={18}/>{issueCount>0&&<i/>}</button><button className="language-v2" onClick={()=>setPreferences(prev=>({...prev,language:prev.language==='en'?'hi':'en'}))}><Languages size={16}/>{preferences.language==='en'?'हिंदी':'EN'}</button><button className="user-chip" onClick={()=>goTo('settings')}><Avatar/><span>{profile.name.split(' ')[0] || 'Workspace'}</span><ChevronDown size={14}/></button></div></header>
 
       <div className="content-v2">
+        {demoMode&&<div className="demo-mode-banner"><Sparkles size={17}/><div><b>Temporary demo workspace</b><span>Changes are not saved to your normal workspace. Uploads use offline processing.</span></div><button className="button-v2 secondary-v2 small-v2" onClick={exitDemo}>Exit Demo</button></div>}
+        {!demoMode&&serverState==='unavailable'&&<div className="server-banner-v2" role="status"><CircleAlert size={16}/><div><b>Saved business records could not be loaded</b><span>{serverError} Only records already saved on this device are shown.</span></div></div>}
         {scanProgress&&<div className="processing-banner"><Sparkles size={17}/><div><b>{scanProgress.phase}</b><span>{scanProgress.name}</span></div><div className="processing-track"><i style={{width:`${scanProgress.percent}%`}}/></div><strong>{scanProgress.percent}%</strong></div>}
         {scanError&&<div className="error-banner"><CircleAlert size={16}/><span>{scanError}</span><button onClick={()=>setScanError('')}><X size={15}/></button></div>}
 
@@ -637,7 +869,7 @@ export default function App() {
         {view==='rules'&&<RulesView query={ruleQuery} setQuery={setRuleQuery} rules={visibleRules} goTo={goTo}/>}
         {view==='ca'&&<CAView invoices={invoices} profile={profile} audit={audit} copyInvite={copyCAInvite} exportWorkbook={exportWorkbook} openInvoice={openInvoice} goTo={goTo}/>}
         {view==='help'&&<HelpView goTo={goTo} runDemo={runDemo} runInjectionDemo={runInjectionDemo}/>}
-        {view==='settings'&&<SettingsView profile={profile} draft={profileDraft} setDraft={setProfileDraft} editing={profileEditing} setEditing={setProfileEditing} saveProfile={saveProfile} preferences={preferences} setPreferences={setPreferences} resetWorkspace={resetWorkspace} audit={audit}/>}
+        {view==='settings'&&<SettingsView profile={profile} draft={profileDraft} setDraft={setProfileDraft} editing={profileEditing} setEditing={setProfileEditing} saveProfile={saveProfile} preferences={preferences} setPreferences={setPreferences} demoMode={demoMode} onTryDemo={runDemo} onExitDemo={exitDemo} audit={audit} user={user} business={business} onSignOut={onLogout?signOut:null} signingOut={signingOut}/>}
       </div>
       <footer className="footer-v2"><span>© 2026 BillSetu</span><span>Local preparation workspace · Nothing is filed automatically</span><button onClick={()=>goTo('help')}>How it works</button><b className="offline-tag"><span/> {backendState==='connected'?'BACKEND CONNECTED':backendState==='checking'?'CHECKING BACKEND':'OFFLINE REPLAY'}</b></footer>
       <input ref={fileInput} type="file" className="hidden-input" accept="image/jpeg,image/png,image/webp,application/pdf,.csv,.xlsx" multiple onChange={handleFileChange}/>
@@ -651,13 +883,14 @@ export default function App() {
 
 function Overview({ invoices, profile, readiness, readyCount, issueCount, totalSales, openInvoice, goTo, onUpload, onFiles, onPeriod, runDemo, audit }) {
   const recent = invoices.filter(item=>item.direction!=='purchase').slice(0,5);
+  const isEmpty = invoices.length === 0;
   return <>
     <div className="welcome-v2"><div><span className="eyebrow-v2"><i/> YOUR {profile.period.toUpperCase()} WORKSPACE</span><h1>GST prep, without the guesswork.</h1><p>Bring in your bills. BillSetu checks the details. You decide what goes into the draft.</p></div><div className="welcome-actions"><label className="period-v2"><CalendarDays size={16}/><select aria-label="Filing period" value={profile.period} onChange={event=>onPeriod(event.target.value)}><option>November 2026</option><option>October 2026</option><option>September 2026</option><option>August 2026</option><option>July 2026</option><option>June 2026</option></select><ChevronDown size={14}/></label><button className="button-v2 primary-v2" onClick={()=>goTo('reports')}><ArrowDownToLine size={16}/> Prepare draft</button></div></div>
-    <section className="hero-v2"><div className="hero-copy-v2"><span className="eyebrow-v2">PRE-FILING CHECKUP · {profile.period.toUpperCase()}</span><h2>{issueCount ? 'A little review now.' : 'Your records are in good shape.'}<br/><em>A smoother filing later.</em></h2><p>{issueCount ? `${issueCount} record${issueCount===1?'':'s'} need a closer look before they can be included in a draft.` : 'Every confirmed outward record is ready for the next review step.'}</p><div className="hero-actions-v2"><button className="button-v2 light-v2" onClick={()=>goTo('attention')}>{issueCount?`Review ${issueCount} record${issueCount===1?'':'s'}`:'Review all records'} <ArrowRight size={15}/></button><button className="text-button-v2" onClick={runDemo}><Sparkles size={15}/> Run 30-second demo</button></div><div className="privacy-note-v2"><LockKeyhole size={13}/> Your documents are processed on this device in replay mode.</div></div><div className="readiness-card-v2"><span>DATA READINESS</span><div className="readiness-number-v2">{readiness}<small>%</small></div><div className="readiness-bar-v2"><i style={{width:`${readiness}%`}}/></div><small>Based on {invoices.filter(item=>item.direction!=='purchase').length} outward records</small><div className="readiness-legend-v2"><span><i className="green-dot-v2"/>{readyCount} confirmed</span><span><i className="amber-dot-v2"/>{issueCount} to review</span></div></div><div className="hero-spark-v2" aria-hidden="true">✦</div></section>
+    <section className="hero-v2"><div className="hero-copy-v2"><span className="eyebrow-v2">{isEmpty?'GET STARTED':'PRE-FILING CHECKUP'} · {profile.period.toUpperCase()}</span><h2>{isEmpty?'Upload your first invoice.':issueCount ? 'A little review now.' : 'Your records are in good shape.'}<br/><em>{isEmpty?'Start with one bill.':'A smoother filing later.'}</em></h2><p>{isEmpty?'Your workspace is empty. Add a bill to begin, or explore the sample workspace first.':issueCount ? `${issueCount} record${issueCount===1?'':'s'} need a closer look before they can be included in a draft.` : 'Every confirmed outward record is ready for the next review step.'}</p><div className="hero-actions-v2">{isEmpty?<button className="button-v2 light-v2" onClick={onUpload}><Upload size={15}/> Upload your first invoice</button>:<button className="button-v2 light-v2" onClick={()=>goTo('attention')}>{issueCount?`Review ${issueCount} record${issueCount===1?'':'s'}`:'Review all records'} <ArrowRight size={15}/></button>}<button className="text-button-v2" onClick={runDemo}><Sparkles size={15}/> Try Demo</button></div><div className="privacy-note-v2"><LockKeyhole size={13}/> {isEmpty?'Your records stay in this browser. Demo changes are temporary.':'Your documents are processed on this device.'}</div></div><div className="readiness-card-v2"><span>DATA READINESS</span><div className="readiness-number-v2">{readiness}<small>%</small></div><div className="readiness-bar-v2"><i style={{width:`${readiness}%`}}/></div><small>Based on {invoices.filter(item=>item.direction!=='purchase').length} outward records</small><div className="readiness-legend-v2"><span><i className="green-dot-v2"/>{readyCount} confirmed</span><span><i className="amber-dot-v2"/>{issueCount} to review</span></div></div><div className="hero-spark-v2" aria-hidden="true">✦</div></section>
     <section className="journey-v2"><div className="section-heading-v2"><div><span className="eyebrow-v2">HOW BILLSETU WORKS</span><h3>From a paper bill to a reviewable draft</h3></div><button className="text-button-v2" onClick={()=>goTo('help')}>See the steps <ArrowRight size={14}/></button></div><div className="journey-steps-v2">{[['1','Bring bills','Photos, PDFs or register',CloudUpload,()=>onUpload()],['2','Read & organize','Local OCR or spreadsheet import',FileText,()=>goTo('invoices')],['3','Check & fix','12 explainable rule checks',ShieldCheck,()=>goTo('attention')],['4','You confirm','Owner or CA review',CheckCheck,()=>goTo('attention')],['5','Prepare draft','JSON + CA review pack',FileDown,()=>goTo('reports')]].map(([n,title,sub,Icon,action])=><button key={n} onClick={action} className="journey-step-v2"><span className="journey-icon-v2"><Icon size={18}/></span><span className="journey-number-v2">STEP {n}</span><b>{title}</b><small>{sub}</small></button>)}</div></section>
     <section className="stat-grid-v2"><StatCard icon={Activity} label="Taxable sales captured" value={money(totalSales)} note={`${invoices.filter(item=>item.direction!=='purchase').length} outward records`}/><StatCard icon={CircleAlert} label="Need your attention" value={issueCount} note={issueCount?'Review before export':'Nothing waiting'} tone="amber" action={()=>goTo('attention')}/><StatCard icon={ReceiptText} label="Bills in workspace" value={invoices.length} note={`${readyCount} confirmed for draft`}/><StatCard icon={Zap} label="Records handled" value={audit.filter(item=>item.action.includes('Import')).length+invoices.filter(item=>item.confirmed).length} note="Time back from manual re-entry"/></section>
     <div className="dashboard-grid-v2"><section className="panel-v2 upload-panel-v2"><div className="panel-title-v2"><div><span className="panel-icon-v2"><CloudUpload size={19}/></span><div><h3>Add this month’s bills</h3><p>Photos, PDFs, CSV or Excel sales register. Up to 5 files per batch.</p></div></div><button className="icon-v2" title="Open help for uploads" onClick={()=>goTo('help')}><HelpCircle size={17}/></button></div><button className="dropzone-v2" onClick={onUpload} onDragOver={event=>event.preventDefault()} onDrop={event=>{event.preventDefault();const files=event.dataTransfer.files;if(files.length)onFiles(files);}}><span className="upload-symbol-v2"><Upload size={21}/></span><b>Choose bills or drop them here</b><small>JPG, PNG, WebP, searchable/scanned PDF, CSV, XLSX · 10 MB each</small><span className="button-v2 primary-v2 small-v2"><Plus size={15}/> Choose files</span></button><p className="panel-footnote-v2"><LockKeyhole size={13}/> Files stay in this browser. Scanned-image OCR downloads the English model on first use.</p><a className="text-button-v2 sample-link-v2" href="/sample-sales-register.csv" download><Download size={14}/> Download sample register</a></section>
-      <section className="panel-v2 quick-panel-v2"><div className="panel-title-v2"><div><span className="panel-icon-v2 mint-v2"><Gauge size={19}/></span><div><h3>Your next steps</h3><p>Keep the month moving with three small steps.</p></div></div></div><div className="next-step-v2" onClick={()=>goTo('attention')} role="button" tabIndex={0} onKeyDown={event=>event.key==='Enter'&&goTo('attention')}><span className={issueCount?'step-state-v2 pending-v2':'step-state-v2 complete-v2'}>{issueCount?<CircleAlert size={16}/>:<Check size={16}/>}</span><span><b>{issueCount?`Review ${issueCount} flagged records`:'Review queue is clear'}</b><small>{issueCount?'Fix errors or record a CA escalation.':'All outward records are confirmed.'}</small></span><ArrowRight size={16}/></div><div className="next-step-v2" onClick={()=>goTo('rules')} role="button" tabIndex={0} onKeyDown={event=>event.key==='Enter'&&goTo('rules')}><span className="step-state-v2 neutral-v2"><BookOpenCheck size={16}/></span><span><b>Understand the checks</b><small>See what BillSetu can and cannot verify.</small></span><ArrowRight size={16}/></div><div className="next-step-v2" onClick={()=>goTo('reports')} role="button" tabIndex={0} onKeyDown={event=>event.key==='Enter'&&goTo('reports')}><span className="step-state-v2 neutral-v2"><FileDown size={16}/></span><span><b>Prepare your CA pack</b><small>{readyCount} confirmed sales record{readyCount===1?'':'s'} ready.</small></span><ArrowRight size={16}/></div></section></div>
+      <section className="panel-v2 quick-panel-v2"><div className="panel-title-v2"><div><span className="panel-icon-v2 mint-v2"><Gauge size={19}/></span><div><h3>Your next steps</h3><p>{isEmpty?'Start with a bill or explore the demo.':'Keep the month moving with three small steps.'}</p></div></div></div><div className="next-step-v2" onClick={()=>goTo('attention')} role="button" tabIndex={0} onKeyDown={event=>event.key==='Enter'&&goTo('attention')}><span className={issueCount?'step-state-v2 pending-v2':'step-state-v2 complete-v2'}>{issueCount?<CircleAlert size={16}/>:<Check size={16}/>}</span><span><b>{issueCount?`Review ${issueCount} flagged records`:isEmpty?'No records to review yet':'Review queue is clear'}</b><small>{issueCount?'Fix errors or record a CA escalation.':isEmpty?'Your review queue will appear after you add a bill.':'All outward records are confirmed.'}</small></span><ArrowRight size={16}/></div><div className="next-step-v2" onClick={()=>goTo('rules')} role="button" tabIndex={0} onKeyDown={event=>event.key==='Enter'&&goTo('rules')}><span className="step-state-v2 neutral-v2"><BookOpenCheck size={16}/></span><span><b>Understand the checks</b><small>See what BillSetu can and cannot verify.</small></span><ArrowRight size={16}/></div><div className="next-step-v2" onClick={()=>goTo('reports')} role="button" tabIndex={0} onKeyDown={event=>event.key==='Enter'&&goTo('reports')}><span className="step-state-v2 neutral-v2"><FileDown size={16}/></span><span><b>Prepare your CA pack</b><small>{readyCount} confirmed sales record{readyCount===1?'':'s'} ready.</small></span><ArrowRight size={16}/></div></section></div>
     <RecordsTable invoices={recent} title="Recent records" subtitle="A quick look at what is ready and what needs you" onOpen={openInvoice} onAll={()=>goTo('invoices')}/>
     <section className="audit-teaser-v2"><div><History size={17}/><span><b>Recent activity</b><small>{audit.slice(0,2).map(entry=>entry.action).join(' · ')||'Your review history appears here.'}</small></span></div><button onClick={()=>goTo('settings')}>View activity <ArrowRight size={14}/></button></section>
   </>;
@@ -666,13 +899,14 @@ function Overview({ invoices, profile, readiness, readyCount, issueCount, totalS
 function StatCard({ icon:Icon,label,value,note,tone,action }) { return <article className="stat-card-v2" onClick={action}><span className={`stat-icon-v2 ${tone||''}`}><Icon size={17}/></span><span className="stat-label-v2">{label}</span><b className="stat-value-v2">{value}</b><small>{note}</small></article>; }
 
 function RecordsView({ invoices, allInvoices, filter, setFilter, view, openInvoice, onDelete, onUpload, onManual, profile, readiness }) {
-  return <section className="page-v2"><div className="page-intro-v2"><div><span className="eyebrow-v2">{view==='attention'?'OWNER REVIEW QUEUE':profile.period.toUpperCase()}</span><h1>{view==='attention'?'Let’s clear the loose ends.':'Every bill, in one place.'}</h1><p>{view==='attention'?'Each record explains what needs attention. Nothing is included in the draft until you confirm it.':'Search, review, filter, and organize this period’s sales and purchase bills.'}</p></div><div className="button-row-v2"><button className="button-v2 secondary-v2" onClick={onManual}><Plus size={16}/> Enter a bill</button><button className="button-v2 primary-v2" onClick={onUpload}><Upload size={16}/> Add files</button></div></div><div className="summary-strip-v2"><div><b>{allInvoices.length}</b><small>Total records</small></div><div><b>{allInvoices.filter(item=>item.status==='ready'&&item.direction!=='purchase').length}</b><small>Confirmed sales</small></div><div><b>{allInvoices.filter(item=>item.status!=='ready'&&item.direction!=='purchase').length}</b><small>To review</small></div><div><b>{money(allInvoices.filter(item=>item.direction!=='purchase').reduce((sum,item)=>sum+Number(item.amount||0),0))}</b><small>Taxable captured</small></div><div><b>{readiness}%</b><small>Readiness</small></div></div><section className="panel-v2 table-panel-v2"><div className="filter-toolbar-v2"><div className="filter-pills-v2">{[['all','All',allInvoices.length],['attention','Needs attention',allInvoices.filter(item=>item.status!=='ready'&&item.direction!=='purchase').length],['ready','Confirmed',allInvoices.filter(item=>item.status==='ready').length],['purchase','Purchases',allInvoices.filter(item=>item.direction==='purchase').length]].map(([key,label,count])=><button key={key} className={filter===key?'active':''} onClick={()=>setFilter(key)}>{label}<i>{count}</i></button>)}</div><span><ListFilter size={15}/> {invoices.length} shown</span></div><InvoiceTable invoices={invoices} openInvoice={openInvoice} onDelete={onDelete}/>{!invoices.length&&<div className="empty-v2"><Search size={25}/><b>No bills match this view</b><span>Try another filter, or add a new bill.</span></div>}</section></section>;
+  const noFilterMatches = allInvoices.length > 0 && invoices.length === 0;
+  return <section className="page-v2"><div className="page-intro-v2"><div><span className="eyebrow-v2">{view==='attention'?'OWNER REVIEW QUEUE':profile.period.toUpperCase()}</span><h1>{view==='attention'?'Let’s clear the loose ends.':'Every bill, in one place.'}</h1><p>{view==='attention'?'Each record explains what needs attention. Nothing is included in the draft until you confirm it.':'Search, review, filter, and organize this period’s sales and purchase bills.'}</p></div><div className="button-row-v2"><button className="button-v2 secondary-v2" onClick={onManual}><Plus size={16}/> Enter a bill</button><button className="button-v2 primary-v2" onClick={onUpload}><Upload size={16}/> Add files</button></div></div><div className="summary-strip-v2"><div><b>{allInvoices.length}</b><small>Total records</small></div><div><b>{allInvoices.filter(item=>item.status==='ready'&&item.direction!=='purchase').length}</b><small>Confirmed sales</small></div><div><b>{allInvoices.filter(item=>item.status!=='ready'&&item.direction!=='purchase').length}</b><small>To review</small></div><div><b>{money(allInvoices.filter(item=>item.direction!=='purchase').reduce((sum,item)=>sum+Number(item.amount||0),0))}</b><small>Taxable captured</small></div><div><b>{readiness}%</b><small>Readiness</small></div></div><section className="panel-v2 table-panel-v2"><div className="filter-toolbar-v2"><div className="filter-pills-v2">{[['all','All',allInvoices.length],['attention','Needs attention',allInvoices.filter(item=>item.status!=='ready'&&item.direction!=='purchase').length],['ready','Confirmed',allInvoices.filter(item=>item.status==='ready').length],['purchase','Purchases',allInvoices.filter(item=>item.direction==='purchase').length]].map(([key,label,count])=><button key={key} className={filter===key?'active':''} onClick={()=>setFilter(key)}>{label}<i>{count}</i></button>)}</div><span><ListFilter size={15}/> {invoices.length} shown</span></div><InvoiceTable invoices={invoices} openInvoice={openInvoice} onDelete={onDelete}/>{noFilterMatches&&<div className="empty-v2"><Search size={25}/><b>No bills match this view</b><span>Try another filter, or add a new bill.</span></div>}</section></section>;
 }
 
 function RecordsTable({ invoices, title, subtitle, onOpen, onAll }) { return <section className="panel-v2 records-panel-v2"><div className="panel-title-v2"><div><div><h3>{title}</h3><p>{subtitle}</p></div></div><button className="text-button-v2" onClick={onAll}>See all <ArrowRight size={14}/></button></div><InvoiceTable invoices={invoices} openInvoice={onOpen}/></section>; }
 
 function InvoiceTable({ invoices, openInvoice, onDelete }) {
-  return <div className="table-wrap-v2"><table className="table-v2"><thead><tr><th>Bill</th><th>Customer</th><th>Taxable value</th><th>Return type</th><th>Status</th><th>Action</th></tr></thead><tbody>{invoices.map(invoice=><tr key={invoice.id}><td><button className="invoice-link-v2" onClick={()=>openInvoice(invoice)}><span className="table-file-v2"><FileText size={16}/></span><span><b>{invoice.no}</b><small>{fmtDate(invoice.isoDate||invoice.date)} · {invoice.source}</small></span></button></td><td><b className="table-party-v2">{invoice.party}</b><small className="table-gstin-v2">{invoice.gstin}</small></td><td><b>{money(invoice.amount)}</b></td><td><span className={`bucket-v2 ${String(invoice.bucket).toLowerCase()}`}>{invoice.direction==='purchase'?'Purchase':invoice.bucket||'Review'}</span></td><td><span className={`status-v2 ${invoice.status}`}><i/>{statusName(invoice.status)}</span></td><td><div className="table-actions-v2"><button className="open-record-v2" onClick={()=>openInvoice(invoice)}>Review <ArrowRight size={14}/></button>{onDelete&&<button className="delete-record-v2" aria-label={`Delete ${invoice.no}`} title="Delete record" onClick={()=>onDelete(invoice)}><Trash2 size={15}/></button>}</div></td></tr>)}</tbody></table>{!invoices.length&&<div className="empty-v2"><b>No records yet</b><span>Upload a bill or import a sales register to get started.</span></div>}</div>;
+  return <div className="table-wrap-v2"><table className="table-v2"><thead><tr><th>Bill</th><th>Customer</th><th>Taxable value</th><th>Return type</th><th>Status</th><th>Action</th></tr></thead><tbody>{invoices.map(invoice=><tr key={invoice.id}><td><button className="invoice-link-v2" onClick={()=>openInvoice(invoice)}><span className="table-file-v2"><FileText size={16}/></span><span><b>{invoice.no}</b><small>{fmtDate(invoice.isoDate||invoice.date)} · {invoice.source} · {invoice.backendInvoiceId?'BillSetu record':'Local only'}</small></span></button></td><td><b className="table-party-v2">{invoice.party}</b><small className="table-gstin-v2">{invoice.gstin}</small></td><td><b>{money(invoice.amount)}</b></td><td><span className={`bucket-v2 ${String(invoice.bucket).toLowerCase()}`}>{invoice.direction==='purchase'?'Purchase':invoice.bucket||'Review'}</span></td><td><span className={`status-v2 ${invoice.status}`}><i/>{statusName(invoice.status)}</span></td><td><div className="table-actions-v2"><button className="open-record-v2" onClick={()=>openInvoice(invoice)}>Review <ArrowRight size={14}/></button>{onDelete&&<button className="delete-record-v2" aria-label={`Delete ${invoice.no}`} title="Delete record" onClick={()=>onDelete(invoice)}><Trash2 size={15}/></button>}</div></td></tr>)}</tbody></table>{!invoices.length&&<div className="empty-v2"><b>No records yet</b><span>Upload a bill or import a sales register to get started.</span></div>}</div>;
 }
 
 function ReportsView({ invoices, profile, issueCount, readyCount, exportDraft, exportWorkbook, exportCSV, openInvoice, goTo }) {
@@ -715,9 +949,56 @@ function RulesView({ query,setQuery,rules,goTo }) { return <section className="p
 
 function CAView({ invoices,profile,audit,copyInvite,exportWorkbook,openInvoice,goTo }) { const pending=invoices.filter(item=>item.status!=='ready'&&item.direction!=='purchase'); const confirmed=invoices.filter(item=>item.status==='ready'&&item.confirmed&&item.direction!=='purchase'); return <section className="page-v2"><div className="page-intro-v2"><div><span className="eyebrow-v2">ACCOUNTANT COLLABORATION</span><h1>A calmer hand-off to your CA.</h1><p>Prepare a review pack and a clear note. Your CA keeps authority over tax classification and filing.</p></div><button className="button-v2 primary-v2" onClick={exportWorkbook}><FileSpreadsheet size={16}/> Build CA pack</button></div><div className="ca-hero-v2"><div className="ca-avatar-v2"><Building2 size={26}/></div><div><span className="eyebrow-v2">THIS CLIENT WORKSPACE</span><h2>{profile.name}</h2><p>{profile.gstin} · {profile.state} · {profile.period}</p></div><button className="button-v2 secondary-v2" onClick={copyInvite}>Copy review note</button></div><div className="ca-stats-v2"><div><b>{pending.length}</b><small>Needs owner or CA review</small></div><div><b>{confirmed.length}</b><small>Owner-confirmed sales</small></div><div><b>{invoices.filter(item=>item.direction==='purchase').length}</b><small>Purchases · ITC unverified</small></div></div><RecordsTable invoices={pending.slice(0,6)} title="Shared review queue" subtitle="Open any bill for its source, checks and correction history." onOpen={openInvoice} onAll={()=>goTo('attention')}/><section className="panel-v2 activity-panel-v2"><div className="panel-title-v2"><div><span className="panel-icon-v2"><History size={18}/></span><div><h3>Workspace activity</h3><p>Locally saved action history for this prototype.</p></div></div></div>{audit.slice(0,6).map(entry=><div className="activity-row-v2" key={entry.id}><span><History size={15}/></span><div><b>{entry.action} · {entry.invoice}</b><small>{entry.details}</small></div><time>{new Date(entry.at).toLocaleString('en-IN')}</time></div>)}{!audit.length&&<div className="empty-v2">No activity recorded yet.</div>}</section><p className="small-note-v2">To share outside this browser, download the CA review pack and send it using your own secure channel. No records are sent automatically.</p></section>; }
 
-function HelpView({ goTo,runDemo,runInjectionDemo }) { const entries=[['How do I begin?','Upload one bill or import a register. We read supported files on this device, then open every record for your review.'],['What does OCR do?','OCR suggests text from a photo. It can misread handwriting. Compare every field with the source and correct it before confirmation.'],['What does “Ready” mean?','Required checks passed and an owner confirmed the record. It does not certify the tax rate, active GSTIN status, ITC or legal position.'],['Can BillSetu file a return?','No. BillSetu prepares a draft and review pack. The registered taxpayer or authorized professional reviews and files through the official GST channel.'],['Are purchase bills ITC eligible?','BillSetu only logs purchase bills. ITC eligibility requires separate verification, including GSTR-2B/IMS and applicable rules.'],['Where is my data saved?','Records and file copies are stored in this browser. Clear site data or use Reset workspace in Settings to remove the local workspace.']]; return <section className="page-v2"><div className="page-intro-v2"><div><span className="eyebrow-v2">PLAIN-LANGUAGE HELP</span><h1>GST prep, one small step at a time.</h1><p>Quick answers for shop owners and the people who help them review.</p></div><div className="button-row-v2"><button className="button-v2 secondary-v2" onClick={runInjectionDemo}><ShieldCheck size={16}/> Test document safety</button><button className="button-v2 primary-v2" onClick={runDemo}><Sparkles size={16}/> Try the sample</button></div></div><div className="help-layout-v2"><div className="faq-list-v2">{entries.map(([question,answer])=><details key={question} open={question==='How do I begin?'}><summary>{question}<ChevronDown size={16}/></summary><p>{answer}</p></details>)}</div><aside className="help-aside-v2"><CircleHelp size={22}/><h3>Need a person?</h3><p>Use the CA workspace to create a review note and workbook for your accountant.</p><button className="button-v2 secondary-v2" onClick={()=>goTo('ca')}>Open CA workspace <ArrowRight size={15}/></button></aside></div></section>; }
+function HelpView({ goTo,runDemo,runInjectionDemo }) {
+  const entries=[
+    ['How do I begin?','Upload one bill or import a register. We read supported files on this device, then open every record for your review.'],
+    ['What does OCR do?','OCR suggests text from a photo. It can misread handwriting. Compare every field with the source and correct it before confirmation.'],
+    ['What does “Ready” mean?','Required checks passed and an owner confirmed the record. It does not certify the tax rate, active GSTIN status, ITC or legal position.'],
+    ['Can BillSetu file a return?','No. BillSetu prepares a draft and review pack. The registered taxpayer or authorized professional reviews and files through the official GST channel.'],
+    ['Are purchase bills ITC eligible?','BillSetu only logs purchase bills. ITC eligibility requires separate verification, including GSTR-2B/IMS and applicable rules.'],
+    ['Where is my data saved?','Records and file copies are stored in this browser. Try Demo opens a temporary sample workspace; exiting it restores your previous workspace without deleting local records.'],
+  ];
+  return <section className="page-v2"><div className="page-intro-v2"><div><span className="eyebrow-v2">PLAIN-LANGUAGE HELP</span><h1>GST prep, one small step at a time.</h1><p>Quick answers for shop owners and the people who help them review.</p></div><div className="button-row-v2"><button className="button-v2 secondary-v2" onClick={runInjectionDemo}><ShieldCheck size={16}/> Test document safety</button><button className="button-v2 primary-v2" onClick={runDemo}><Sparkles size={16}/> Try Demo</button></div></div><div className="help-layout-v2"><div className="faq-list-v2">{entries.map(([question,answer])=><details key={question} open={question==='How do I begin?'}><summary>{question}<ChevronDown size={16}/></summary><p>{answer}</p></details>)}</div><aside className="help-aside-v2"><CircleHelp size={22}/><h3>Need a person?</h3><p>Use the CA workspace to create a review note and workbook for your accountant.</p><button className="button-v2 secondary-v2" onClick={()=>goTo('ca')}>Open CA workspace <ArrowRight size={15}/></button></aside></div></section>;
+}
 
-function SettingsView({ profile,draft,setDraft,editing,setEditing,saveProfile,preferences,setPreferences,resetWorkspace,audit }) { return <section className="page-v2"><div className="page-intro-v2"><div><span className="eyebrow-v2">BUSINESS PROFILE</span><h1>Your business, your rules.</h1><p>These details help BillSetu organize records and make basic consistency checks.</p></div>{editing?<div className="button-row-v2"><button className="button-v2 secondary-v2" onClick={()=>setEditing(false)}>Cancel</button><button className="button-v2 primary-v2" onClick={saveProfile}><Check size={16}/> Save profile</button></div>:<button className="button-v2 secondary-v2" onClick={()=>{setDraft(profile);setEditing(true);}}>Edit profile</button>}</div><div className="settings-grid-v2"><section className="panel-v2 settings-panel-v2"><div className="settings-business-v2"><span className="settings-logo-v2">{profile.name.slice(0,1)}</span><div><h3>{profile.name}</h3><p>{profile.state} · {profile.scheme==='composition'?'Composition':'Regular'} taxpayer profile</p></div></div><div className="form-grid-v2"><FormField label="Business name" value={editing?draft.name:profile.name} disabled={!editing} onChange={value=>setDraft(prev=>({...prev,name:value}))}/><FormField label="Business GSTIN" value={editing?draft.gstin:profile.gstin} disabled={!editing} onChange={value=>setDraft(prev=>({...prev,gstin:value.toUpperCase()}))}/><FormField label="Registered business address" value={editing?draft.address:profile.address} disabled={!editing} onChange={value=>setDraft(prev=>({...prev,address:value}))}/><label className="form-field-v2"><span>Taxpayer scheme</span><select disabled={!editing} value={editing?draft.scheme:profile.scheme} onChange={event=>setDraft(prev=>({...prev,scheme:event.target.value}))}><option value="regular">Regular</option><option value="composition">Composition</option></select></label><label className="form-field-v2"><span>Annual turnover band</span><select disabled={!editing} value={editing?draft.turnover:profile.turnover} onChange={event=>setDraft(prev=>({...prev,turnover:event.target.value}))}><option value="under-5cr">Up to ₹5 crore</option><option value="over-5cr">Above ₹5 crore</option></select></label><label className="form-field-v2"><span>Filing frequency</span><select disabled={!editing} value={editing?draft.filing:profile.filing} onChange={event=>setDraft(prev=>({...prev,filing:event.target.value}))}><option>Monthly</option><option>Quarterly</option></select></label><label className="form-field-v2"><span>Filing period</span><select disabled={!editing} value={editing?draft.period:profile.period} onChange={event=>setDraft(prev=>({...prev,period:event.target.value}))}><option>November 2026</option><option>October 2026</option><option>September 2026</option><option>August 2026</option><option>July 2026</option><option>June 2026</option></select></label></div><div className="settings-info-v2"><ShieldCheck size={17}/><span>GSTIN structure is checked locally. BillSetu does not verify the GST portal’s active status.</span></div></section><section className="panel-v2 settings-panel-v2"><h3>Preferences & local data</h3><p>Choose how BillSetu behaves on this device.</p><div className="settings-option-v2"><span className="settings-option-icon"><Languages size={18}/></span><div><b>Language</b><small>Navigation labels and review hints</small></div><div className="language-switch-v2"><button className={preferences.language==='en'?'active':''} onClick={()=>setPreferences(prev=>({...prev,language:'en'}))}>English</button><button className={preferences.language==='hi'?'active':''} onClick={()=>setPreferences(prev=>({...prev,language:'hi'}))}>हिंदी</button></div></div><div className="settings-option-v2"><span className="settings-option-icon"><HardDrive size={18}/></span><div><b>Guided demo replay</b><small>{preferences.replay?'Synthetic demo scenarios are available':'Turn on to add synthetic GST review scenarios'}</small></div><button className={`mode-badge-v2 ${preferences.replay?'':'off'}`} aria-pressed={preferences.replay} onClick={()=>setPreferences(prev=>({...prev,replay:!prev.replay}))}>{preferences.replay?'ON':'OFF'}</button></div><div className="settings-option-v2"><span className="settings-option-icon"><LockKeyhole size={18}/></span><div><b>Browser-local storage</b><small>{audit.length} review actions saved on this device</small></div><span className="local-dot"/></div><button className="button-v2 danger-outline-v2" onClick={resetWorkspace}><RotateCcw size={16}/> Reset to sample workspace</button><p className="small-note-v2">Reset deletes local imported records and source files from this browser. Export records first if you need to keep them.</p></section></div><section className="panel-v2 activity-panel-v2"><div className="panel-title-v2"><div><span className="panel-icon-v2"><History size={18}/></span><div><h3>Recent changes</h3><p>Append-only activity history for the local prototype.</p></div></div></div>{audit.slice(0,10).map(entry=><div className="activity-row-v2" key={entry.id}><span><History size={15}/></span><div><b>{entry.action} · {entry.invoice}</b><small>{entry.details}</small></div><time>{new Date(entry.at).toLocaleString('en-IN')}</time></div>)}</section></section>; }
+function SettingsView({ profile,draft,setDraft,editing,setEditing,saveProfile,preferences,setPreferences,demoMode,onTryDemo,onExitDemo,audit,user,business,onSignOut,signingOut }) {
+  const businessName = profile.name || 'Business details not added';
+  return <section className="page-v2">
+    <div className="page-intro-v2"><div><span className="eyebrow-v2">BUSINESS PROFILE</span><h1>Your business, your rules.</h1><p>These details help BillSetu organize records and make basic consistency checks.</p></div>{editing?<div className="button-row-v2"><button className="button-v2 secondary-v2" onClick={()=>setEditing(false)}>Cancel</button><button className="button-v2 primary-v2" onClick={saveProfile}><Check size={16}/> Save profile</button></div>:<button className="button-v2 secondary-v2" onClick={()=>{setDraft(profile);setEditing(true);}}>Edit profile</button>}</div>
+    <div className="settings-grid-v2">
+      <section className="panel-v2 settings-panel-v2">
+        <div className="settings-business-v2"><span className="settings-logo-v2">{profile.name.slice(0,1) || 'B'}</span><div><h3>{businessName}</h3><p>{profile.state || 'Business information is optional for now'} · {profile.scheme==='composition'?'Composition':'Regular'} taxpayer profile</p></div></div>
+        <div className="form-grid-v2">
+          <FormField label="Business name" value={editing?draft.name:profile.name} disabled={!editing} onChange={value=>setDraft(prev=>({...prev,name:value}))}/>
+          <FormField label="Business GSTIN" value={editing?draft.gstin:profile.gstin} disabled={!editing} onChange={value=>setDraft(prev=>({...prev,gstin:value.toUpperCase()}))}/>
+          <FormField label="Registered business address" value={editing?draft.address:profile.address} disabled={!editing} onChange={value=>setDraft(prev=>({...prev,address:value}))}/>
+          <label className="form-field-v2"><span>Taxpayer scheme</span><select disabled={!editing} value={editing?draft.scheme:profile.scheme} onChange={event=>setDraft(prev=>({...prev,scheme:event.target.value}))}><option value="regular">Regular</option><option value="composition">Composition</option></select></label>
+          <label className="form-field-v2"><span>Annual turnover band</span><select disabled={!editing} value={editing?draft.turnover:profile.turnover} onChange={event=>setDraft(prev=>({...prev,turnover:event.target.value}))}><option value="under-5cr">Up to ₹5 crore</option><option value="over-5cr">Above ₹5 crore</option></select></label>
+          <label className="form-field-v2"><span>Filing frequency</span><select disabled={!editing} value={editing?draft.filing:profile.filing} onChange={event=>setDraft(prev=>({...prev,filing:event.target.value}))}><option>Monthly</option><option>Quarterly</option></select></label>
+          <label className="form-field-v2"><span>Filing period</span><select disabled={!editing} value={editing?draft.period:profile.period} onChange={event=>setDraft(prev=>({...prev,period:event.target.value}))}><option>November 2026</option><option>October 2026</option><option>September 2026</option><option>August 2026</option><option>July 2026</option><option>June 2026</option></select></label>
+        </div>
+        <div className="settings-info-v2"><ShieldCheck size={17}/><span>GSTIN structure is checked locally. BillSetu does not verify the GST portal’s active status.</span></div>
+      </section>
+      <section className="panel-v2 settings-panel-v2">
+        <h3>Preferences & local data</h3><p>Choose how BillSetu behaves on this device.</p>
+        <div className="settings-option-v2"><span className="settings-option-icon"><Languages size={18}/></span><div><b>Language</b><small>Navigation labels and review hints</small></div><div className="language-switch-v2"><button className={preferences.language==='en'?'active':''} onClick={()=>setPreferences(prev=>({...prev,language:'en'}))}>English</button><button className={preferences.language==='hi'?'active':''} onClick={()=>setPreferences(prev=>({...prev,language:'hi'}))}>हिंदी</button></div></div>
+        <div className="settings-option-v2"><span className="settings-option-icon"><LockKeyhole size={18}/></span><div><b>Browser-local storage</b><small>{audit.length} {demoMode?'temporary demo actions in this session':'review actions saved on this device'}</small></div><span className="local-dot"/></div>
+        <button className="button-v2 secondary-v2" onClick={demoMode?onExitDemo:onTryDemo}><Sparkles size={16}/>{demoMode?'Exit Demo':'Try Demo'}</button>
+        <p className="small-note-v2">Demo changes are temporary. Entering or exiting the demo never removes your existing local records or source files.</p>
+      </section>
+    </div>
+    <section className="panel-v2 account-panel-v2">
+      <div>
+        <span className="eyebrow-v2">BILLSETU ACCOUNT</span>
+        <h3>{demoMode?'Temporary demo workspace':(business?.name || user?.email || 'Signed in')}</h3>
+        <p>{demoMode?'Demo changes are never sent to an account and are discarded when you exit.':(onSignOut?'Your session is held by the BillSetu backend in an HttpOnly cookie. Browser-saved records stay on this device until ownership is added.':'This workspace is not signed in to BillSetu.' )}</p>
+      </div>
+      {onSignOut&&!demoMode&&<button className="button-v2 secondary-v2" onClick={onSignOut} disabled={signingOut}><LogOut size={16}/>{signingOut?'Signing out…':'Sign out'}</button>}
+    </section>
+    <section className="panel-v2 activity-panel-v2"><div className="panel-title-v2"><div><span className="panel-icon-v2"><History size={18}/></span><div><h3>Recent changes</h3>
+<p>{demoMode?'Temporary demo activity':'Activity history for this workspace'}</p></div></div></div>{audit.slice(0,10).map(entry=><div className="activity-row-v2" key={entry.id}><span><History size={15}/></span><div><b>{entry.action} · {entry.invoice}</b><small>{entry.details}</small></div><time>{new Date(entry.at).toLocaleString('en-IN')}</time></div>)}{!audit.length&&<div className="empty-v2">No activity recorded yet.</div>}</section>
+  </section>;
+}
 function FormField({label,value,disabled,onChange,type='text'}) { return <label className="form-field-v2"><span>{label}</span><input type={type} value={value??''} disabled={disabled} onChange={event=>onChange(event.target.value)}/></label>; }
 
 function ReviewModal({ invoice,profile,invoices,findings,language,onClose,onSave,onConfirm,onEscalate,onApply,onUpdate,onAudit }) {
@@ -803,3 +1084,116 @@ function ReviewModal({ invoice,profile,invoices,findings,language,onClose,onSave
 }
 
 function ManualEntry({ onClose,onSave }) { const [data,setData]=useState({no:'',party:'',gstin:'Unregistered',isoDate:'',amount:'',tax:'',totalWritten:'',posStateCode:'',buyerAddress:'',hsn:'',bucket:'Review'}); const update=(key,value)=>setData(prev=>({...prev,[key]:value})); return <div className="modal-overlay-v2" onMouseDown={event=>event.target===event.currentTarget&&onClose()}><form className="manual-modal-v2" onSubmit={event=>{event.preventDefault();const state=STATE_CODES[data.posStateCode]||'';onSave(makeInvoice({...data,party:data.party||'Buyer to confirm',amount:Number(data.amount)||0,tax:Number(data.tax)||0,totalWritten:Number(data.totalWritten)||Number(data.amount||0)+Number(data.tax||0),pos:state,status:'review',issues:['New manual record — review each field'],confidence:null,isoDate:data.isoDate,date:data.isoDate,source:'Manual entry',kind:'Tax invoice',items:[],cgst:0,sgst:0,igst:0,taxHeadsCaptured:false}));}}><header><span><Plus size={18}/> New bill</span><button type="button" className="icon-v2" onClick={onClose}><X size={18}/></button></header><p>Enter the main details from the source bill. You can correct them in the review step.</p><div className="manual-fields-v2"><FormField label="Invoice number" value={data.no} onChange={value=>update('no',value)}/><FormField label="Invoice date" type="date" value={data.isoDate} onChange={value=>update('isoDate',value)}/><FormField label="Customer / buyer" value={data.party} onChange={value=>update('party',value)}/><FormField label="Buyer GSTIN or Unregistered" value={data.gstin} onChange={value=>update('gstin',value.toUpperCase())}/><FormField label="Taxable value (₹)" type="number" value={data.amount} onChange={value=>update('amount',value)}/><FormField label="Total tax (₹)" type="number" value={data.tax} onChange={value=>update('tax',value)}/><FormField label="Grand total on bill (₹)" type="number" value={data.totalWritten} onChange={value=>update('totalWritten',value)}/><label className="form-field-v2"><span>Place of supply</span><select value={data.posStateCode} onChange={event=>update('posStateCode',event.target.value)}><option value="">Choose state</option>{Object.entries(STATE_CODES).map(([code,state])=><option key={code} value={code}>{code} · {state}</option>)}</select></label></div><footer><button type="button" className="button-v2 secondary-v2" onClick={onClose}>Cancel</button><button className="button-v2 primary-v2" type="submit"><Check size={16}/> Add and review</button></footer></form></div>; }
+
+function AuthLoading() {
+  return <div className="auth-v2">
+    <section className="auth-card-v2 auth-loading-v2" role="status" aria-live="polite">
+      <span className="auth-mark-v2"><ReceiptText size={21}/></span>
+      <b className="auth-word-v2">billsetu<span>.</span></b>
+      <p>Checking your session…</p>
+      <span className="auth-track-v2"><i/></span>
+    </section>
+  </div>;
+}
+
+function AuthScreen({ startupError, onLogin, onRegister, onTryDemo }) {
+  const [mode, setMode] = useState('login');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [confirmation, setConfirmation] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [startupNoticeCleared, setStartupNoticeCleared] = useState(false);
+  const emailInput = useRef(null);
+  const isLogin = mode === 'login';
+  const visibleError = error || (startupNoticeCleared ? '' : startupError);
+
+  useEffect(() => { emailInput.current?.focus(); }, [mode]);
+
+  const switchMode = nextMode => {
+    setMode(nextMode);
+    setError('');
+    setPassword('');
+    setConfirmation('');
+  };
+  const submit = async event => {
+    event.preventDefault();
+    if (busy) return;
+    const validation = validateAuthForm({ mode, email, password, confirmation });
+    if (validation) { setError(validation); return; }
+    setBusy(true);
+    setError('');
+    setStartupNoticeCleared(true);
+    try {
+      if (isLogin) await onLogin(email, password);
+      else await onRegister(email, password);
+    } catch (requestError) {
+      setError(requestError?.message || 'Something went wrong. Please try again.');
+      setBusy(false);
+    }
+  };
+
+  return <div className="auth-v2">
+    <div className="auth-shell-v2">
+      <aside className="auth-aside-v2">
+        <span className="auth-mark-v2"><ReceiptText size={21}/></span>
+        <b className="auth-word-v2">billsetu<span>.</span></b>
+        <h1>GST prep, without the guesswork.</h1>
+        <p>Bring your bills into one workspace. BillSetu checks the details in plain language so you or your CA can review before anything is filed.</p>
+        <ul>
+          <li><ShieldCheck size={15}/> 12 explainable checks on every record</li>
+          <li><LockKeyhole size={15}/> Nothing is filed automatically</li>
+          <li><FileSpreadsheet size={15}/> Drafts and CA packs you control</li>
+        </ul>
+        <div className="auth-aside-foot-v2"><Lock size={14}/> Signed in with a secure BillSetu session</div>
+      </aside>
+      <section className="auth-card-v2">
+        <div className="auth-card-head-v2">
+          <span className="eyebrow-v2">{isLogin ? 'WELCOME BACK' : 'CREATE YOUR ACCOUNT'}</span>
+          <h2>{isLogin ? 'Sign in to BillSetu' : 'Start your workspace'}</h2>
+          <p>{isLogin ? 'Use the email and password for your BillSetu account.' : 'One account keeps your BillSetu workspace separate from anyone else using this browser.'}</p>
+        </div>
+        <form className="auth-form-v2" onSubmit={submit} noValidate>
+          <label className="auth-field-v2"><span>Email address</span>
+            <span className="auth-input-v2"><Mail size={15}/><input ref={emailInput} type="email" value={email} autoComplete="email" inputMode="email" placeholder="you@business.in" disabled={busy} onChange={event => setEmail(event.target.value)}/></span>
+          </label>
+          <label className="auth-field-v2"><span>Password</span>
+            <span className="auth-input-v2"><Lock size={15}/><input type="password" value={password} autoComplete={isLogin ? 'current-password' : 'new-password'} placeholder={isLogin ? 'Your password' : 'At least 8 characters'} disabled={busy} onChange={event => setPassword(event.target.value)}/></span>
+          </label>
+          {!isLogin && <label className="auth-field-v2"><span>Confirm password</span>
+            <span className="auth-input-v2"><Lock size={15}/><input type="password" value={confirmation} autoComplete="new-password" placeholder="Repeat your password" disabled={busy} onChange={event => setConfirmation(event.target.value)}/></span>
+          </label>}
+          {visibleError && <div className="auth-error-v2" role="alert"><CircleAlert size={15}/><span>{visibleError}</span></div>}
+          <button className="button-v2 primary-v2 auth-submit-v2" type="submit" disabled={busy}>
+            {busy ? <><span className="auth-spinner-v2"/> {isLogin ? 'Signing in…' : 'Creating account…'}</> : <>{isLogin ? 'Sign in' : 'Create account'} <ArrowRight size={16}/></>}
+          </button>
+        </form>
+        <div className="auth-switch-v2">
+          {isLogin ? <>New to BillSetu? <button type="button" onClick={() => switchMode('register')} disabled={busy}>Create an account</button></>
+            : <>Already have an account? <button type="button" onClick={() => switchMode('login')} disabled={busy}>Sign in</button></>}
+        </div>
+        <div className="auth-demo-v2">
+          <span>Just exploring?</span>
+          <button type="button" onClick={onTryDemo}><Sparkles size={14}/> Try Demo</button>
+        </div>
+      </section>
+    </div>
+    <footer className="auth-footer-v2"><span>© 2026 BillSetu</span><span>Local preparation workspace · Demo data is temporary</span></footer>
+  </div>;
+}
+
+export default function App() {
+  const { status, user, business, startupError, login, register, logout, switchBusiness } = useAuth();
+  const [demoPreview, setDemoPreview] = useState(false);
+
+  if (status === 'loading') return <AuthLoading />;
+
+  if (status === 'unauthenticated') {
+    if (demoPreview) return <Workspace demoOnly onExitDemo={() => setDemoPreview(false)} />;
+    return <AuthScreen startupError={startupError} onLogin={login} onRegister={register} onTryDemo={() => setDemoPreview(true)} />;
+  }
+
+  // Keyed by account *and* business: switching business remounts the workspace,
+  // so no record from the previous business context can stay on screen.
+  return <Workspace key={`${user.id}:${business?.id || 'none'}`} user={user} business={business} onLogout={logout} onSwitchBusiness={switchBusiness} />;
+}

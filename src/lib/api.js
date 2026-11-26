@@ -1,4 +1,4 @@
-const API_BASE_URL = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '');
+const API_BASE_URL = (import.meta.env?.VITE_API_BASE_URL || 'http://localhost:8000').replace(/\/+$/, '');
 
 export class ApiError extends Error {
   constructor(message, status = 0, detail = '') {
@@ -22,7 +22,8 @@ async function readResponse(response) {
 async function request(path, options = {}) {
   let response;
   try {
-    response = await fetch(`${API_BASE_URL}${path}`, options);
+    // The backend session lives in an HttpOnly cookie, so every call must be credentialed.
+    response = await fetch(`${API_BASE_URL}${path}`, { credentials: 'include', ...options });
   } catch {
     throw new ApiError('The BillSetu backend is unavailable.', 0);
   }
@@ -38,6 +39,8 @@ async function request(path, options = {}) {
         : '';
     const messages = {
       400: 'The backend could not process this document request.',
+      401: 'Your BillSetu session is not active. Sign in again to continue.',
+      403: 'This BillSetu session cannot use a business context right now.',
       404: isInvoiceValidation
         ? 'The extracted invoice could not be found for backend validation.'
         : isInvoiceGstr1
@@ -76,7 +79,7 @@ function filenameFromContentDisposition(header) {
 async function requestExport(path) {
   let response;
   try {
-    response = await fetch(`${API_BASE_URL}${path}`, { method: 'GET' });
+    response = await fetch(`${API_BASE_URL}${path}`, { method: 'GET', credentials: 'include' });
   } catch {
     throw new ApiError('The BillSetu backend is unavailable.', 0);
   }
@@ -113,6 +116,146 @@ export async function healthCheck() {
   return request('/health', { method: 'GET' });
 }
 
+function authErrorMessage(path, status) {
+  if (status === 0) return 'The BillSetu backend is unavailable. Check your connection and try again.';
+  if (status === 401) {
+    return path.endsWith('/login')
+      ? 'Invalid email or password.'
+      : 'Your session has expired. Please sign in again.';
+  }
+  if (status === 409) return 'An account with this email already exists. Sign in instead.';
+  if (status === 422) return 'Check the email address and password, then try again.';
+  if (status === 429) return 'Too many attempts. Wait a moment and try again.';
+  return 'The BillSetu server could not complete this request. Try again in a moment.';
+}
+
+function normalizeAuthUser(payload) {
+  if (!payload
+    || typeof payload !== 'object'
+    || typeof payload.id !== 'string'
+    || !payload.id
+    || typeof payload.email !== 'string'
+    || !payload.email) {
+    throw new ApiError('The BillSetu backend returned an unexpected response.', 502);
+  }
+  return { id: payload.id, email: payload.email, isActive: payload.is_active !== false };
+}
+
+async function authRequest(path, options = {}) {
+  let response;
+  try {
+    response = await fetch(`${API_BASE_URL}${path}`, {
+      credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      ...options,
+    });
+  } catch {
+    throw new ApiError(authErrorMessage(path, 0), 0);
+  }
+
+  const payload = await readResponse(response);
+  if (!response.ok) {
+    const detail = typeof payload === 'object' && payload && typeof payload.detail === 'string'
+      ? payload.detail
+      : '';
+    throw new ApiError(authErrorMessage(path, response.status), response.status, detail);
+  }
+  return payload;
+}
+
+export async function register(email, password) {
+  const payload = await authRequest('/api/auth/register', {
+    method: 'POST',
+    body: JSON.stringify({ email, password }),
+  });
+  return normalizeAuthUser(payload);
+}
+
+export async function login(email, password) {
+  const payload = await authRequest('/api/auth/login', {
+    method: 'POST',
+    body: JSON.stringify({ email, password }),
+  });
+  return normalizeAuthUser(payload);
+}
+
+export async function getCurrentUser() {
+  return normalizeAuthUser(await authRequest('/api/auth/me', { method: 'GET' }));
+}
+
+function normalizeBusiness(payload) {
+  if (!payload
+    || typeof payload !== 'object'
+    || typeof payload.id !== 'string'
+    || !payload.id
+    || typeof payload.name !== 'string'
+    || !payload.name) {
+    throw new ApiError('The BillSetu backend returned an unexpected business response.', 502);
+  }
+  return {
+    id: payload.id,
+    name: payload.name,
+    isActive: payload.is_active !== false,
+  };
+}
+
+export async function getCurrentBusiness() {
+  return normalizeBusiness(await authRequest('/api/businesses/current', { method: 'GET' }));
+}
+
+export async function listBusinesses() {
+  const payload = await authRequest('/api/businesses', { method: 'GET' });
+  if (!Array.isArray(payload)) throw new ApiError('The BillSetu backend returned an unexpected response.', 502);
+  return payload.map(normalizeBusiness);
+}
+
+export async function switchBusiness(businessId) {
+  if (!businessId) throw new ApiError('Choose a business before switching.', 422);
+  return normalizeBusiness(await authRequest(`/api/businesses/${encodeURIComponent(businessId)}/switch`, {
+    method: 'POST',
+  }));
+}
+
+export async function logout() {
+  await authRequest('/api/auth/logout', { method: 'POST' });
+}
+
+const MALFORMED_LIST = 'The BillSetu backend returned an unexpected record list.';
+
+function recordList(payload) {
+  if (!Array.isArray(payload)) throw new ApiError(MALFORMED_LIST, 502);
+  return payload;
+}
+
+/**
+ * Business-scoped invoice list. The backend derives the business from the
+ * session cookie, so the browser never sends an owner. Each row is an invoice
+ * summary (header fields only, no line items).
+ */
+export async function listInvoices() {
+  const payload = recordList(await request('/api/invoices', { method: 'GET' }));
+  payload.forEach(row => {
+    if (!row || typeof row !== 'object' || typeof row.invoice_id !== 'string' || !row.invoice_id.trim()) {
+      throw new ApiError(MALFORMED_LIST, 502);
+    }
+  });
+  return payload;
+}
+
+/**
+ * Business-scoped document metadata. Document contents are never fetched here;
+ * the protected content endpoint stays an on-demand call per preview.
+ */
+export async function listDocuments() {
+  const payload = recordList(await request('/api/documents', { method: 'GET' }));
+  payload.forEach(row => {
+    if (!row || typeof row !== 'object' || typeof row.document_id !== 'string' || !row.document_id.trim()) {
+      throw new ApiError(MALFORMED_LIST, 502);
+    }
+  });
+  return payload;
+}
+
 export async function uploadDocument(file) {
   const form = new FormData();
   form.append('file', file);
@@ -135,6 +278,7 @@ export async function getDocumentContent(documentId) {
   try {
     response = await fetch(`${API_BASE_URL}/api/documents/${encodeURIComponent(documentId)}/content`, {
       method: 'GET',
+      credentials: 'include',
     });
   } catch {
     throw new ApiError('The BillSetu backend is unavailable.', 0);

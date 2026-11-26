@@ -107,8 +107,11 @@ def test_mark_persists_changes(monkeypatch, tmp_path):
     assert restored.invoice_id == "invoice-123"
 
 
-def test_unknown_document_id_returns_404_through_api():
-    response = TestClient(app).get(
+def test_unknown_document_id_returns_404_through_api(sign_in):
+    client = TestClient(app)
+    sign_in(client)
+
+    response = client.get(
         "/api/documents/does-not-exist"
     )
 

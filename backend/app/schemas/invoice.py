@@ -70,6 +70,33 @@ class CanonicalInvoice(BaseModel):
         return value
 
 
+class InvoiceSummary(BaseModel):
+    """One row of the business-scoped invoice list.
+
+    A read model derived from `CanonicalInvoice`, so the canonical invoice
+    contract itself is unchanged. It carries invoice-header facts only: enough
+    for the workspace list and its totals without shipping a full invoice
+    payload per row or forcing a request per invoice.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+    invoice_id: str
+    invoice_number: str = ""
+    invoice_date: date | None = None
+    transaction_direction: Literal["outward_sale", "inward_purchase"] = "outward_sale"
+    supplier_name: str | None = None
+    buyer_name: str | None = None
+    buyer_gstin: str | None = None
+    place_of_supply_state_code: str | None = None
+    taxable_value: Decimal = Field(default=Decimal("0"), ge=0)
+    cgst_total: Decimal = Field(default=Decimal("0"), ge=0)
+    sgst_total: Decimal = Field(default=Decimal("0"), ge=0)
+    igst_total: Decimal = Field(default=Decimal("0"), ge=0)
+    cess_total: Decimal = Field(default=Decimal("0"), ge=0)
+    grand_total: Decimal = Field(default=Decimal("0"), ge=0)
+    document_id: str | None = None
+
+
 class InvoiceValidationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     invoice: CanonicalInvoice

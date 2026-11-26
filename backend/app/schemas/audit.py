@@ -41,4 +41,7 @@ class AuditEvent(BaseModel):
     status: AuditEventStatus
     message: str
     created_at: datetime
+    # Owning business. `None` marks a legacy event recorded before business
+    # ownership existed; legacy events are never reassigned.
+    business_id: str | None = None
     metadata: dict[str, str | int | float | bool | None] = Field(default_factory=dict)

@@ -17,6 +17,9 @@ class DocumentRecord(BaseModel):
     status: Literal["uploaded", "extracted", "quarantined", "failed"]
     created_at: datetime
     invoice_id: str | None = None
+    # Owning business. `None` marks a legacy record created before business
+    # ownership existed; it is never assigned an owner retroactively.
+    business_id: str | None = None
     security_notes: list[str] = Field(default_factory=list)
 
 

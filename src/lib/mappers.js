@@ -1,4 +1,9 @@
 import { normalizeDate } from './intake.js';
+import { STATE_CODES } from './gst.js';
+
+// Shown when the list endpoint's invoice has no validation result attached yet.
+// A record can only be confirmed once the backend has validated it.
+export const SERVER_VALIDATION_PENDING = 'No backend validation result has been loaded for this invoice yet. Open the record to request one from BillSetu.';
 
 const numberValue = value => {
   if (value === null || value === undefined || value === '') return 0;
@@ -197,6 +202,7 @@ export function mapCanonicalInvoiceToFrontendInvoice(canonicalInvoice, metadata 
     items,
     backendDocumentId: metadata.documentId || '',
     backendInvoiceId: metadata.invoiceId || '',
+    businessId: metadata.businessId || '',
     extractionSource: 'backend',
   };
 
@@ -204,5 +210,79 @@ export function mapCanonicalInvoiceToFrontendInvoice(canonicalInvoice, metadata 
     frontendInvoice,
     metadata.validation || null,
     metadata.validationError || '',
+  );
+}
+
+/**
+ * One invoice as returned by the business-scoped list endpoint.
+ *
+ * The list carries invoice-header facts only, so nothing here downloads line
+ * items or document contents. Validation is requested later, on demand, when
+ * the record is opened.
+ */
+export function mapServerInvoiceSummaryToFrontendInvoice(summary, metadata = {}) {
+  if (!summary || typeof summary !== 'object' || typeof summary.invoice_id !== 'string') {
+    throw new Error('The backend returned an unexpected invoice list row.');
+  }
+
+  const isoDate = normalizeDate(summary.invoice_date || '') || '';
+  const taxable = numberValue(summary.taxable_value);
+  const cgst = numberValue(summary.cgst_total);
+  const sgst = numberValue(summary.sgst_total);
+  const igst = numberValue(summary.igst_total);
+  const cess = numberValue(summary.cess_total);
+  const tax = cgst + sgst + igst + cess;
+  const grandTotal = numberValue(summary.grand_total);
+  const direction = summary.transaction_direction === 'inward_purchase' ? 'purchase' : 'sale';
+  const posStateCode = String(summary.place_of_supply_state_code || '').trim();
+  const document = metadata.document || null;
+
+  const frontendInvoice = {
+    // The backend invoice id is the authoritative identity for a persisted
+    // invoice, so it is also the local row key. That keeps cache reconciliation
+    // a plain id match instead of a second identifier scheme.
+    id: summary.invoice_id,
+    no: String(summary.invoice_number || '').trim() || 'Invoice to identify',
+    party: String(summary.buyer_name || '').trim() || 'Buyer to confirm',
+    gstin: String(summary.buyer_gstin || '').trim() || 'Unregistered',
+    date: isoDate,
+    isoDate,
+    amount: taxable,
+    tax,
+    cgst,
+    sgst,
+    igst,
+    cess,
+    taxHeadsCaptured: [cgst, sgst, igst, cess].some(value => value > 0),
+    totalWritten: grandTotal || taxable + tax,
+    bucket: 'Review',
+    status: direction === 'purchase' ? 'purchase' : 'review',
+    issues: [],
+    source: document?.filename || 'BillSetu business record',
+    confidence: 82,
+    color: 'mint',
+    kind: 'Tax invoice',
+    supplier: String(summary.supplier_name || '').trim(),
+    supplierGstin: '',
+    supplierStateCode: '',
+    supplierAddress: '',
+    buyerAddress: '',
+    pos: STATE_CODES[posStateCode] || '',
+    posStateCode,
+    hsn: '',
+    direction,
+    rawText: '',
+    items: [],
+    backendDocumentId: summary.document_id || '',
+    backendInvoiceId: summary.invoice_id,
+    businessId: metadata.businessId || '',
+    extractionSource: 'backend',
+    serverLoadedAt: metadata.loadedAt || '',
+  };
+
+  return mapBackendValidationToFrontendInvoice(
+    frontendInvoice,
+    metadata.validation || null,
+    metadata.validationError || SERVER_VALIDATION_PENDING,
   );
 }

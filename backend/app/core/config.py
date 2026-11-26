@@ -1,9 +1,12 @@
 import os
 
-from dotenv import load_dotenv
-from pydantic import BaseModel, Field, field_validator
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
-load_dotenv()
+from pydantic import BaseModel, Field, field_validator
 
 
 def _secure_cookie_default() -> bool:

@@ -39,6 +39,7 @@ app.add_middleware(
 
 
 @app.get("/health", tags=["system"])
+@app.get("/api/health", tags=["system"])
 def health() -> dict[str, str]:
     return {"status": "ok", "service": "billsetu-backend", "version": "0.1.0"}
 

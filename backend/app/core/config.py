@@ -24,8 +24,18 @@ class Settings(BaseModel):
     gemini_primary_model: str | None = Field(default_factory=lambda: os.getenv("GEMINI_PRIMARY_MODEL"))
     gemini_fallback_model: str | None = Field(default_factory=lambda: os.getenv("GEMINI_FALLBACK_MODEL"))
     max_upload_bytes: int = Field(default_factory=lambda: int(os.getenv("MAX_UPLOAD_BYTES", "10485760")))
-    storage_root: str = Field(default_factory=lambda: os.getenv("DOCUMENT_STORAGE_ROOT", ".data/private-documents"))
-    auth_database_path: str = Field(default_factory=lambda: os.getenv("AUTH_DATABASE_PATH", ".data/auth.sqlite3"))
+    storage_root: str = Field(
+        default_factory=lambda: os.getenv(
+            "DOCUMENT_STORAGE_ROOT",
+            "/tmp/billsetu/private-documents" if os.getenv("VERCEL") else ".data/private-documents",
+        )
+    )
+    auth_database_path: str = Field(
+        default_factory=lambda: os.getenv(
+            "AUTH_DATABASE_PATH",
+            "/tmp/billsetu/auth.sqlite3" if os.getenv("VERCEL") else ".data/auth.sqlite3",
+        )
+    )
     auth_session_ttl_seconds: int = Field(
         default_factory=lambda: int(os.getenv("AUTH_SESSION_TTL_SECONDS", "43200")),
         gt=0,

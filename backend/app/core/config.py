@@ -49,7 +49,7 @@ class Settings(BaseModel):
             origin.strip()
             for origin in os.getenv(
                 "CORS_ALLOWED_ORIGINS",
-                "http://localhost:4173,http://127.0.0.1:4173,http://localhost:5173,http://127.0.0.1:5173,https://billsetu-gamma.vercel.app,https://billsetu.vercel.app",
+                "http://localhost:4173,http://127.0.0.1:4173,http://localhost:5173,http://127.0.0.1:5173,https://billsetu-gamma.vercel.app,https://billsetu.vercel.app,https://billsetu-vanshchaudhary001s-projects.vercel.app",
             ).split(",")
             if origin.strip()
         ]

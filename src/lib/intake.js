@@ -129,14 +129,14 @@ function extractFromText(rawText, fileName, confidence = 66) {
   const gstins = rawText.match(/\b\d{2}[A-Z0-9]{13}\b/gi) || [];
   const invoiceNo = first(/(?:invoice|bill|voucher)\s*(?:no|number|#)\s*[:.-]?\s*([A-Z0-9/-]{3,20})/i, /\b([A-Z]{1,5}\/[A-Z0-9/-]{3,16})\b/i);
   const dateText = first(/(?:invoice|bill)?\s*date\s*[:.-]?\s*(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})/i, /\b(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})\b/);
-  const amount = parseMoney(first(/(?:taxable value|taxable amount|assessable value|subtotal)\s*[:.-]?\s*(?:₹|rs\.?\s*)?([\d,]+(?:\.\d{1,2})?)/i));
-  const capturedTax = parseMoney(first(/(?:total gst|total tax|tax amount|gst amount)\s*[:.-]?\s*(?:₹|rs\.?\s*)?([\d,]+(?:\.\d{1,2})?)/i));
-  const cgst = parseMoney(first(/(?:cgst)\s*[:.-]?\s*(?:₹|rs\.?\s*)?([\d,]+(?:\.\d{1,2})?)/i));
-  const sgst = parseMoney(first(/(?:sgst)\s*[:.-]?\s*(?:₹|rs\.?\s*)?([\d,]+(?:\.\d{1,2})?)/i));
-  const igst = parseMoney(first(/(?:igst)\s*[:.-]?\s*(?:₹|rs\.?\s*)?([\d,]+(?:\.\d{1,2})?)/i));
-  const cess = parseMoney(first(/(?:cess)\s*[:.-]?\s*(?:₹|rs\.?\s*)?([\d,]+(?:\.\d{1,2})?)/i));
+  const amount = parseMoney(first(/(?:taxable value|taxable amount|assessable value|subtotal)\s*[:.-]?\s*(?:[₹nRs]\.?)?\s*([\d,]+(?:\.\d{1,2})?)/i));
+  const capturedTax = parseMoney(first(/(?:total gst|total tax|tax amount|gst amount)\s*[:.-]?\s*(?:[₹nRs]\.?)?\s*([\d,]+(?:\.\d{1,2})?)/i));
+  const cgst = parseMoney(first(/(?:cgst)\s*[:.-]?\s*(?:[₹nRs]\.?)?\s*([\d,]+(?:\.\d{1,2})?)/i));
+  const sgst = parseMoney(first(/(?:sgst)\s*[:.-]?\s*(?:[₹nRs]\.?)?\s*([\d,]+(?:\.\d{1,2})?)/i));
+  const igst = parseMoney(first(/(?:igst)\s*[:.-]?\s*(?:[₹nRs]\.?)?\s*([\d,]+(?:\.\d{1,2})?)/i));
+  const cess = parseMoney(first(/(?:cess)\s*[:.-]?\s*(?:[₹nRs]\.?)?\s*([\d,]+(?:\.\d{1,2})?)/i));
   const tax = capturedTax || cgst + sgst + igst + cess;
-  const total = parseMoney(first(/(?:grand total|invoice total|bill total|total amount|total)\s*[:.-]?\s*(?:₹|rs\.?\s*)?([\d,]+(?:\.\d{1,2})?)/i));
+  const total = parseMoney(first(/(?:grand total|invoice total|bill total|total amount)\s*[:.-]?\s*(?:[₹nRs]\.?)?\s*([\d,]+(?:\.\d{1,2})?)/i));
   const buyer = first(/(?:buyer|customer|bill to|party)\s*(?:name)?\s*[:.-]\s*([^\r\n]+)/i);
   const supplier = first(/(?:supplier|seller|from)\s*(?:name)?\s*[:.-]\s*([^\r\n]+)/i) || lines.find(line => line.length > 3 && !/tax invoice|gstin|invoice|phone|date/i.test(line)) || '';
   const gstin = gstins.find(item => item.toUpperCase() !== (gstins[0] || '').toUpperCase()) || gstins[0] || 'Unregistered';
@@ -180,6 +180,7 @@ async function readPdf(file, onProgress) {
   }
   const text = pages.join('\n');
   if (text.replace(/\s/g, '').length > 80) return { text, confidence: 88 };
+  let currentPage = 1;
   const { createWorker } = await import('tesseract.js');
   const pageCount = Math.min(pdf.numPages, 5);
   const worker = await createWorker('eng', 1, {
@@ -187,7 +188,6 @@ async function readPdf(file, onProgress) {
   });
   const recognized = [];
   const confidences = [];
-  let currentPage = 1;
   try {
     for (; currentPage <= pageCount; currentPage += 1) {
       const page = await pdf.getPage(currentPage);

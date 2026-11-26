@@ -21,7 +21,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="BillSetu Backend",
+    title="Bill Setu Backend",
     version="0.1.0",
     description="GST pre-flight preparation and validation API. It does not file returns.",
     lifespan=lifespan,

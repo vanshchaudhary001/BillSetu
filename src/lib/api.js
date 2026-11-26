@@ -25,7 +25,7 @@ async function request(path, options = {}) {
     // The backend session lives in an HttpOnly cookie, so every call must be credentialed.
     response = await fetch(`${API_BASE_URL}${path}`, { credentials: 'include', ...options });
   } catch {
-    throw new ApiError('The BillSetu backend is unavailable.', 0);
+    throw new ApiError('The Bill Setu backend is unavailable.', 0);
   }
 
   const payload = await readResponse(response);
@@ -39,8 +39,8 @@ async function request(path, options = {}) {
         : '';
     const messages = {
       400: 'The backend could not process this document request.',
-      401: 'Your BillSetu session is not active. Sign in again to continue.',
-      403: 'This BillSetu session cannot use a business context right now.',
+      401: 'Your Bill Setu session is not active. Sign in again to continue.',
+      403: 'This Bill Setu session cannot use a business context right now.',
       404: isInvoiceValidation
         ? 'The extracted invoice could not be found for backend validation.'
         : isInvoiceGstr1
@@ -81,7 +81,7 @@ async function requestExport(path) {
   try {
     response = await fetch(`${API_BASE_URL}${path}`, { method: 'GET', credentials: 'include' });
   } catch {
-    throw new ApiError('The BillSetu backend is unavailable.', 0);
+    throw new ApiError('The Bill Setu backend is unavailable.', 0);
   }
 
   if (!response.ok) {
@@ -117,7 +117,7 @@ export async function healthCheck() {
 }
 
 function authErrorMessage(path, status) {
-  if (status === 0) return 'The BillSetu backend is unavailable. Check your connection and try again.';
+  if (status === 0) return 'The Bill Setu backend is unavailable. Check your connection and try again.';
   if (status === 401) {
     return path.endsWith('/login')
       ? 'Invalid email or password.'
@@ -126,7 +126,7 @@ function authErrorMessage(path, status) {
   if (status === 409) return 'An account with this email already exists. Sign in instead.';
   if (status === 422) return 'Check the email address and password, then try again.';
   if (status === 429) return 'Too many attempts. Wait a moment and try again.';
-  return 'The BillSetu server could not complete this request. Try again in a moment.';
+  return 'The Bill Setu server could not complete this request. Try again in a moment.';
 }
 
 function normalizeAuthUser(payload) {
@@ -136,7 +136,7 @@ function normalizeAuthUser(payload) {
     || !payload.id
     || typeof payload.email !== 'string'
     || !payload.email) {
-    throw new ApiError('The BillSetu backend returned an unexpected response.', 502);
+    throw new ApiError('The Bill Setu backend returned an unexpected response.', 502);
   }
   return { id: payload.id, email: payload.email, isActive: payload.is_active !== false };
 }
@@ -190,7 +190,7 @@ function normalizeBusiness(payload) {
     || !payload.id
     || typeof payload.name !== 'string'
     || !payload.name) {
-    throw new ApiError('The BillSetu backend returned an unexpected business response.', 502);
+    throw new ApiError('The Bill Setu backend returned an unexpected business response.', 502);
   }
   return {
     id: payload.id,
@@ -205,7 +205,7 @@ export async function getCurrentBusiness() {
 
 export async function listBusinesses() {
   const payload = await authRequest('/api/businesses', { method: 'GET' });
-  if (!Array.isArray(payload)) throw new ApiError('The BillSetu backend returned an unexpected response.', 502);
+  if (!Array.isArray(payload)) throw new ApiError('The Bill Setu backend returned an unexpected response.', 502);
   return payload.map(normalizeBusiness);
 }
 
@@ -220,7 +220,7 @@ export async function logout() {
   await authRequest('/api/auth/logout', { method: 'POST' });
 }
 
-const MALFORMED_LIST = 'The BillSetu backend returned an unexpected record list.';
+const MALFORMED_LIST = 'The Bill Setu backend returned an unexpected record list.';
 
 function recordList(payload) {
   if (!Array.isArray(payload)) throw new ApiError(MALFORMED_LIST, 502);
@@ -281,7 +281,7 @@ export async function getDocumentContent(documentId) {
       credentials: 'include',
     });
   } catch {
-    throw new ApiError('The BillSetu backend is unavailable.', 0);
+    throw new ApiError('The Bill Setu backend is unavailable.', 0);
   }
 
   if (!response.ok) {

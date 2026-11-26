@@ -118,7 +118,7 @@ export function readLocalState(key, fallback) {
 
 export function writeLocalState(key, value) {
   try { localStorage.setItem(scopedKey(key), JSON.stringify(value)); }
-  catch (error) { console.error('BillSetu could not save local workspace state.', error); }
+  catch (error) { console.error('Bill Setu could not save local workspace state.', error); }
 }
 
 // --- business-scoped server cache ------------------------------------------
@@ -142,5 +142,5 @@ export function readBusinessState(key, fallback, business) {
 export function writeBusinessState(key, value, business) {
   if (!business) return;
   try { localStorage.setItem(businessScopedKey(key, business), JSON.stringify(value)); }
-  catch (error) { console.error('BillSetu could not save the server record cache.', error); }
+  catch (error) { console.error('Bill Setu could not save the server record cache.', error); }
 }

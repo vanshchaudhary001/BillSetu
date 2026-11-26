@@ -3,7 +3,7 @@ import { STATE_CODES } from './gst.js';
 
 // Shown when the list endpoint's invoice has no validation result attached yet.
 // A record can only be confirmed once the backend has validated it.
-export const SERVER_VALIDATION_PENDING = 'No backend validation result has been loaded for this invoice yet. Open the record to request one from BillSetu.';
+export const SERVER_VALIDATION_PENDING = 'No backend validation result has been loaded for this invoice yet. Open the record to request one from Bill Setu.';
 
 const numberValue = value => {
   if (value === null || value === undefined || value === '') return 0;
@@ -258,7 +258,7 @@ export function mapServerInvoiceSummaryToFrontendInvoice(summary, metadata = {})
     bucket: 'Review',
     status: direction === 'purchase' ? 'purchase' : 'review',
     issues: [],
-    source: document?.filename || 'BillSetu business record',
+    source: document?.filename || 'Bill Setu business record',
     confidence: 82,
     color: 'mint',
     kind: 'Tax invoice',

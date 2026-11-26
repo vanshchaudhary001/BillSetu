@@ -93,3 +93,21 @@
 .workspace-switcher-v2:hover{background:#ffffff12}.workspace-switcher-v2 .workspace-avatar{display:grid;place-items:center}.workspace-switcher-copy-v2{min-width:0;flex:1;display:grid;gap:2px}.workspace-switcher-copy-v2 b,.workspace-switcher-copy-v2 small{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.workspace-switcher-copy-v2 b{font-size:11px}.workspace-switcher-copy-v2 small{font-size:9px;color:#adc1b0}.workspace-switcher-v2 select{position:absolute;inset:0;width:100%;opacity:0;cursor:pointer}.workspace-switcher-v2 select:disabled{cursor:default}.workspace-switcher-v2:has(select:focus-visible){outline:2px solid #9dd3aa;outline-offset:2px}
 @media(max-width:980px){.workspace-switcher-v2{width:auto;padding:6px;border:0;background:transparent;margin-bottom:17px}.workspace-switcher-copy-v2,.workspace-switcher-v2>svg{display:none}.workspace-switcher-v2 .workspace-avatar{width:38px;height:38px}}
 @media(max-width:700px){.workspace-switcher-v2{display:none}}
+
+/* Dropzone processing loader */
+.dropzone-v2.processing{border-style:solid;border-color:#81b28c;background:#f3f8f2;cursor:wait;pointer-events:none}
+.dropzone-spinner-wrap{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;width:100%;padding:10px 14px;text-align:center}
+.dropzone-spinner-icon{width:44px;height:44px;border-radius:50%;background:#e5f1e7;color:#2f7655;display:grid;place-items:center;box-shadow:0 0 0 4px #e5f1e780}
+.spin-circle{animation:spin-rotate 1s linear infinite}
+@keyframes spin-rotate{0%{transform:rotate(0deg)}100%{transform:rotate(360deg)}}
+.dropzone-progress-info{display:flex;flex-direction:column;align-items:center;gap:4px;width:100%}
+.dropzone-filename{font-size:13px;font-weight:700;color:#2e4739;max-width:92%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.dropzone-phase-text{font-size:11px;font-weight:600;color:#49755b;display:inline-flex;align-items:center;gap:6px}
+.phase-pulse-dot{width:6px;height:6px;border-radius:50%;background:#509f69;animation:pulse-dot 1.2s ease-in-out infinite}
+@keyframes pulse-dot{0%,100%{opacity:1;transform:scale(1)}50%{opacity:.4;transform:scale(.75)}}
+.dropzone-meter-wrap{width:100%;max-width:240px;display:flex;align-items:center;gap:8px;margin-top:3px}
+.dropzone-meter-track{flex:1;height:6px;background:#dae7dc;border-radius:6px;overflow:hidden}
+.dropzone-meter-track i{height:100%;display:block;background:#3f875c;border-radius:6px;transition:width .25s ease}
+.dropzone-meter-val{font-size:11px;font-weight:800;color:#38664b;min-width:32px;text-align:right}
+.dropzone-subtext{font-size:10px;color:#809486;margin-top:2px}
+.processing-banner>svg.spin-circle{color:#2f7655;flex:none}

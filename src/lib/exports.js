@@ -66,7 +66,7 @@ export function makeGstr1Draft(invoices, profile = {}, filingPeriod = 'October 2
     gstin: String(profile.gstin || ''),
     fp: `${String(month).padStart(2, '0')}${year}`,
     version: 'BillSetu-local-draft',
-    _billsetu_notice: 'Preparation draft only. This locally generated structure has not been certified against the currently downloaded GSTN offline tool/schema. Import and validate it in the official GST utility, then have the taxpayer or CA review it. BillSetu does not file returns.',
+    _billsetu_notice: 'Preparation draft only. This locally generated structure has not been certified against the currently downloaded GSTN offline tool/schema. Import and validate it in the official GST utility, then have the taxpayer or CA review it. Bill Setu does not file returns.',
     b2b: [...b2bGroups.values()],
     b2cl,
     b2cs: [...b2csGroups.values()],
@@ -78,7 +78,7 @@ export function makeGstr1Draft(invoices, profile = {}, filingPeriod = 'October 2
 export async function makeCAWorkbook(invoices, profile = {}, auditEntries = []) {
   const { default: ExcelJS } = await import('exceljs');
   const workbook = new ExcelJS.Workbook();
-  workbook.creator = 'BillSetu';
+  workbook.creator = 'Bill Setu';
   workbook.created = new Date();
   workbook.subject = 'GST pre-filing review pack';
   workbook.views = [{ state: 'frozen', ySplit: 1 }];
@@ -102,7 +102,7 @@ export async function makeCAWorkbook(invoices, profile = {}, auditEntries = []) 
   auditSheet.getRow(1).font = { bold: true, color: { argb: 'FFFFFFFF' } }; auditSheet.getRow(1).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF315B49' } };
   const guide = workbook.addWorksheet('Read me');
   guide.addRows([
-    ['BILLSETU · CA REVIEW PACK'], ['Business', profile.name || 'Business name not configured'], ['GSTIN', profile.gstin || 'Not configured'], ['Purpose', 'Pre-filing preparation. This is not a filed return or legal opinion.'], ['Purchases', 'Purchase records are listed separately. ITC eligibility is not verified; reconcile with GSTR-2B/IMS and a CA.'], ['Draft export', 'BillSetu generated a draft structure for review. Verify in the official GST portal/offline utility before use.'], ['Privacy', 'This file was generated locally in your browser.'],
+    ['BILL SETU · CA REVIEW PACK'], ['Business', profile.name || 'Business name not configured'], ['GSTIN', profile.gstin || 'Not configured'], ['Purpose', 'Pre-filing preparation. This is not a filed return or legal opinion.'], ['Purchases', 'Purchase records are listed separately. ITC eligibility is not verified; reconcile with GSTR-2B/IMS and a CA.'], ['Draft export', 'Bill Setu generated a draft structure for review. Verify in the official GST portal/offline utility before use.'], ['Privacy', 'This file was generated locally in your browser.'],
   ]);
   guide.getColumn(1).width = 33; guide.getColumn(2).width = 100; guide.getRow(1).font = { bold: true, size: 16 };
   return workbook.xlsx.writeBuffer();

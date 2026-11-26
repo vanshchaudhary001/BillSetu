@@ -5,7 +5,7 @@ from app.core.config import settings
 from app.schemas.invoice import CanonicalInvoice
 
 
-EXTRACTION_PROMPT = """You are BillSetu's document extraction system.
+EXTRACTION_PROMPT = """You are Bill Setu's document extraction system.
 
 Extract only information supported by the document. Never invent missing values;
 return null where information is unavailable and preserve uncertainty in raw

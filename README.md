@@ -1,8 +1,8 @@
-# BillSetu
+# Bill Setu
 
 **Paper bill → checked record → owner-confirmed filing draft.**
 
-BillSetu is a local-first GST preparation prototype for micro-enterprises that still work with paper receipts, handwritten bills, and sales registers. It helps a shop owner capture, understand, and correct records before handing them to a CA or the official GST workflow. Its job is to make the review step understandable; it does not replace a tax professional or file a return.
+Bill Setu is a local-first GST preparation prototype for micro-enterprises that still work with paper receipts, handwritten bills, and sales registers. It helps a shop owner capture, understand, and correct records before handing them to a CA or the official GST workflow. Its job is to make the review step understandable; it does not replace a tax professional or file a return.
 
 ## Run on your computer
 
@@ -35,7 +35,7 @@ Open the URL Vite prints in the terminal (the current desktop preview uses `http
 
 ## Where this fits beside existing products
 
-GST billing and compliance software already exists. For example, myBillBook describes invoicing, inventory, and a bill-scan workflow; ClearTax describes both billing-to-GST hand-off and GST return preparation/reconciliation. BillSetu does not claim those products lack these capabilities. The prototype explores a narrower experience: a paper-first micro-business owner sees the source next to extracted fields, gets plain-language reasons for each flag, and decides what to confirm before exporting a local review pack. That is a product hypothesis to validate with shopkeepers and CAs, not a claim of an empty market. [myBillBook](https://mybillbook.in/s/features/gst-billing-and-invoicing/) · [ClearOne / ClearGST](https://cleartax.in/clearone/gst-connector-for-smes/index.html) · [ClearTax GST](https://cleartax.in/gst).
+GST billing and compliance software already exists. For example, myBillBook describes invoicing, inventory, and a bill-scan workflow; ClearTax describes both billing-to-GST hand-off and GST return preparation/reconciliation. Bill Setu does not claim those products lack these capabilities. The prototype explores a narrower experience: a paper-first micro-business owner sees the source next to extracted fields, gets plain-language reasons for each flag, and decides what to confirm before exporting a local review pack. That is a product hypothesis to validate with shopkeepers and CAs, not a claim of an empty market. [myBillBook](https://mybillbook.in/s/features/gst-billing-and-invoicing/) · [ClearOne / ClearGST](https://cleartax.in/clearone/gst-connector-for-smes/index.html) · [ClearTax GST](https://cleartax.in/gst).
 
 ## Important limits before using real business records
 
@@ -43,7 +43,7 @@ GST billing and compliance software already exists. For example, myBillBook desc
 - Local browser storage is a prototype convenience, not encrypted, managed production storage. Do not use a shared or public computer for sensitive records. Reset in Settings clears the local sample workspace and imported file copies.
 - Image/PDF extraction can miss or misread handwriting, tables, dates, and tax heads. Always compare every field with the source. English OCR model download requires an internet connection the first time it is used.
 - The checks are guardrails, not a legal opinion. A structurally valid GSTIN is not proof that it is active. Tax rates and HSN/SAC classification, place-of-supply edge cases, reverse charge, tax treatment, and ITC eligibility need current official/CA verification.
-- The sample JSON uses a BillSetu draft structure and **is not certified against the current GSTN Offline Tool schema**. Validate using the official utility before any filing workflow. GSTN's own guide documents the official GSTR-1 tables and threshold logic; for example, interstate B2C invoices above ₹1 lakh route to B2CL for applicable periods from August 2024. [GSTN GSTR-1 guide](https://tutorial.gst.gov.in/userguide/returns/Creation_of_Outward_Supplies_Return_in_GSTR-1.htm) · [GSTN Offline Tool guide](https://tutorial.gst.gov.in/downloads/invoiceuploadofflineutility.pdf).
+- The sample JSON uses a Bill Setu draft structure and **is not certified against the current GSTN Offline Tool schema**. Validate using the official utility before any filing workflow. GSTN's own guide documents the official GSTR-1 tables and threshold logic; for example, interstate B2C invoices above ₹1 lakh route to B2CL for applicable periods from August 2024. [GSTN GSTR-1 guide](https://tutorial.gst.gov.in/userguide/returns/Creation_of_Outward_Supplies_Return_in_GSTR-1.htm) · [GSTN Offline Tool guide](https://tutorial.gst.gov.in/downloads/invoiceuploadofflineutility.pdf).
 - Hindi is currently a navigation and review-hint layer, not a full translation of every screen.
 
 ## Implementation
